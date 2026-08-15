@@ -428,8 +428,8 @@ class GameSession:
     last_view: dict = field(default_factory=dict)
     last_view_turn: Optional[int] = None
     last_decision_kind: Optional[str] = None
-    last_explore_ruin_id: Optional[str] = None
-    consecutive_same_explore: int = 0
+    last_action_target: Optional[str] = None  # ruinId, targetAgentId, or targetMonsterId
+    consecutive_same_target: int = 0
 
 
 async def send_hello(ws, entry_type: str) -> None:
@@ -562,40 +562,48 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
 
     decision = decide(view)
 
-    # Safety brake: never re-send the exact same explore on the exact same
-    # ruin more than once without an intervening turn actually advancing.
-    # Root cause this guards against: can_act_changed firing while the
-    # cached view hadn't been refreshed yet led the bot to blindly repeat
-    # `explore` on a ruin whose alert/ambush risk had already changed,
-    # costing large HP between two "identical" decisions.
-    if decision.kind == "explore" and decision.ruin_id:
-        if (
-            decision.ruin_id == session.last_explore_ruin_id
-            and session.last_decision_kind == "explore"
-        ):
-            session.consecutive_same_explore += 1
-        else:
-            session.consecutive_same_explore = 0
-        session.last_explore_ruin_id = decision.ruin_id
+    # Safety brake: never re-send the exact same explore/attack on the exact
+    # same target twice in a row without an intervening turn actually
+    # advancing. Root cause this guards against: can_act_changed firing
+    # while canAct flips back True lets the loop re-decide against a view
+    # that hasn't meaningfully changed (e.g. a monster/ruin id the previous
+    # action already resolved against), so the bot blindly repeats the same
+    # action on a target that may already be dead/depleted, or walks into a
+    # worse ambush than the first attempt.
+    current_target = (
+        decision.ruin_id or decision.target_monster_id or decision.target_agent_id
+    )
+    repeatable_kinds = {"explore", "attack"}
 
-        if session.consecutive_same_explore >= 1:
+    if decision.kind in repeatable_kinds and current_target:
+        if (
+            current_target == session.last_action_target
+            and session.last_decision_kind == decision.kind
+        ):
+            session.consecutive_same_target += 1
+        else:
+            session.consecutive_same_target = 0
+        session.last_action_target = current_target
+
+        if session.consecutive_same_target >= 1:
             log.warning(
-                "refusing to repeat explore on ruin=%s again without a fresh "
+                "refusing to repeat %s on target=%s again without a fresh "
                 "turn (hp=%s) — falling back to repositioning instead",
-                decision.ruin_id, hp,
+                decision.kind, current_target, hp,
             )
             connections = (view.get("currentRegion") or {}).get("connections") or []
             if connections:
                 decision = Decision(
                     kind="move",
                     target_region_id=random.choice(connections),
-                    reason="breaking repeated-explore loop for safety",
+                    reason=f"breaking repeated-{decision.kind} loop for safety",
                 )
             else:
-                decision = Decision(kind="wait", reason="breaking repeated-explore loop, no exit")
-            session.consecutive_same_explore = 0
+                decision = Decision(kind="wait", reason="breaking repeat loop, no exit")
+            session.consecutive_same_target = 0
     else:
-        session.consecutive_same_explore = 0
+        session.consecutive_same_target = 0
+        session.last_action_target = None
 
     session.last_decision_kind = decision.kind
 
