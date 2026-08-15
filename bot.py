@@ -460,7 +460,7 @@ async def play_session(ws, session: GameSession) -> str:
                 return "closed"
 
         elif ftype in ("waiting", "queued"):
-            log.info("%s: %s", ftype, frame.get("message", ""))
+            log.info("%s: %s", ftype, json.dumps(frame)[:300])
 
         elif ftype == "assigned":
             session.game_id = frame.get("gameId")
@@ -468,15 +468,34 @@ async def play_session(ws, session: GameSession) -> str:
 
         elif ftype in ("agent_view", "turn_advanced", "handover_sync"):
             view = frame.get("view", {})
+            prev_hp = (session.last_view.get("self") or {}).get("hp")
+            new_self = view.get("self") or {}
+            new_hp = new_self.get("hp")
             session.last_view = view
             session.last_view_turn = frame.get("turn")
             reason = frame.get("reason")
             log.info(
                 "state update type=%s reason=%s turn=%s hp=%s canAct=%s",
-                ftype, reason, session.last_view_turn,
-                (view.get("self") or {}).get("hp"),
-                session.can_act,
+                ftype, reason, session.last_view_turn, new_hp, session.can_act,
             )
+            # Diagnostic: if HP dropped since the last view and it wasn't
+            # from an attack we just sent, dump the raw self + region block
+            # so the actual damage source (death zone, weather, guardian,
+            # status effect — whatever field the server actually uses) is
+            # visible instead of guessed at.
+            if (
+                prev_hp is not None
+                and new_hp is not None
+                and new_hp < prev_hp
+                and session.last_decision_kind != "attack"
+            ):
+                log.warning(
+                    "HP dropped %s -> %s on a non-attack turn (last action=%s) "
+                    "— raw self=%s region=%s",
+                    prev_hp, new_hp, session.last_decision_kind,
+                    json.dumps(new_self)[:400],
+                    json.dumps(view.get("currentRegion", {}))[:300],
+                )
             await maybe_act(ws, session, view)
 
         elif ftype == "action_rejected":
@@ -631,6 +650,8 @@ async def run_one_game(rest: RestClient, entry_type: str) -> str:
         "X-Version": rest.version,
     }
 
+    join_started_at = time.monotonic()
+
     try:
         async with websockets.connect(
             WS_JOIN_URL, additional_headers=headers, ping_interval=20, ping_timeout=20
@@ -652,7 +673,16 @@ async def run_one_game(rest: RestClient, entry_type: str) -> str:
             return outcome
 
     except ConnectionClosed as e:
-        log.warning("websocket closed: code=%s reason=%s", e.code, e.reason)
+        waited = time.monotonic() - join_started_at
+        log.warning(
+            "websocket closed: code=%s reason=%s (after %.1fs since connect)",
+            e.code, e.reason, waited,
+        )
+        if e.code == 1006 and waited < 120:
+            log.info(
+                "1006 while still in matchmaking queue — likely server-side "
+                "idle/matchmaking timeout, not a bot bug. Will retry."
+            )
         if e.code == 1013:
             log.info("RESUME_TARGET_DEAD — will re-dial for a fresh assignment")
             return "resume_dead"
