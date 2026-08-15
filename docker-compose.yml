@@ -1,0 +1,16 @@
+services:
+  clawroyale-bot:
+    build: .
+    container_name: clawroyale-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - CLAW_LOG_LEVEL=INFO
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # No ports needed — the bot only makes outbound HTTPS/WSS calls.
+    # No volumes needed — the bot is stateless (in-memory only).
