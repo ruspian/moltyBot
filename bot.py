@@ -339,6 +339,25 @@ def decide(view: dict) -> Decision:
                 reason="evacuating death zone",
             )
 
+    # 1.5) Crowded/contested region -> too many visible agents means high
+    #    risk of being attacked from multiple directions at once, even if
+    #    our own HP looks fine right now. Observed pattern: large
+    #    unexplained HP drops (e.g. 87 -> 58 in one turn) happening in
+    #    regions with 15-19+ visible agents, with no death zone / alert
+    #    gauge / weather flag explaining it — most likely damage from
+    #    agents the fight-or-flee logic below doesn't account for when
+    #    the crowd is this dense. Evacuate before engaging with anything.
+    CROWDED_THRESHOLD = 10
+    if len(visible_agents) > CROWDED_THRESHOLD and connections:
+        return Decision(
+            kind="move",
+            target_region_id=random.choice(connections),
+            reason=(
+                f"crowded region ({len(visible_agents)} agents visible) — "
+                "evacuating before engaging, high risk of multi-attacker damage"
+            ),
+        )
+
     # 2) Low HP -> disengage and retreat rather than fight, since survival
     #    time outranks kills in the current ranking rules. This must fire
     #    regardless of WHY hp is low (agent damage, monster counter-hit,
