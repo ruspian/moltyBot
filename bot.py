@@ -69,6 +69,23 @@ logging.basicConfig(
 log = logging.getLogger("clawroyale")
 
 
+def log_info_block(title: str, fields: dict) -> None:
+    """Print a readable multi-line block like:
+        === Account ===
+        nama       : Otooong
+        balance    : 0 sMoltz
+        ...
+    Skips fields whose value is None so optional data doesn't clutter it.
+    """
+    lines = [f"=== {title} ==="]
+    label_width = max((len(k) for k in fields), default=0)
+    for key, value in fields.items():
+        if value is None:
+            continue
+        lines.append(f"  {key.ljust(label_width)} : {value}")
+    log.info("\n" + "\n".join(lines))
+
+
 # --------------------------------------------------------------------------
 # REST client
 # --------------------------------------------------------------------------
@@ -190,6 +207,14 @@ async def ensure_loadout(rest: RestClient) -> None:
     except ApiError as e:
         log.warning("could not read loadout: %s", e)
         return
+
+    log.info(
+        "current loadout: fullSet=%s activePack=%s subPack=%s slots=%s",
+        loadout.get("fullSet"),
+        loadout.get("activePack"),
+        loadout.get("subPack"),
+        loadout.get("slots"),
+    )
 
     if loadout.get("fullSet"):
         log.info("loadout already fullSet — skipping setup")
@@ -432,6 +457,7 @@ class GameSession:
     consecutive_same_target: int = 0
     confirmed_dead_targets: set = field(default_factory=set)
     last_seen_target_hp: dict = field(default_factory=dict)  # targetId -> hp
+    last_equipment_signature: Optional[str] = None
 
 
 async def send_hello(ws, entry_type: str) -> None:
@@ -466,20 +492,66 @@ async def play_session(ws, session: GameSession) -> str:
 
         elif ftype == "assigned":
             session.game_id = frame.get("gameId")
-            log.info("assigned to game %s", session.game_id)
+            log_info_block("Masuk Room", {
+                "room/game id": session.game_id,
+                "entry type": session.entry_type,
+            })
 
         elif ftype in ("agent_view", "turn_advanced", "handover_sync"):
             view = frame.get("view", {})
             prev_hp = (session.last_view.get("self") or {}).get("hp")
             new_self = view.get("self") or {}
             new_hp = new_self.get("hp")
+            new_max_hp = new_self.get("maxHp")
             session.last_view = view
             session.last_view_turn = frame.get("turn")
             reason = frame.get("reason")
-            log.info(
-                "state update type=%s reason=%s turn=%s hp=%s canAct=%s",
-                ftype, reason, session.last_view_turn, new_hp, session.can_act,
+
+            current_region = view.get("currentRegion", {}) or {}
+            visible_agents = view.get("visibleAgents") or []
+            visible_monsters = view.get("visibleMonsters") or []
+            visible_ruins = view.get("visibleRuins") or []
+
+            hp_display = (
+                f"{new_hp}/{new_max_hp}" if new_max_hp else str(new_hp)
             )
+
+            log_info_block("Status", {
+                "turn": session.last_view_turn,
+                "hp": hp_display,
+                "ep": new_self.get("ep"),
+                "bisa aksi": session.can_act,
+                "posisi (region)": current_region.get("id"),
+                "death zone": current_region.get("isDeathZone"),
+                "musuh terlihat": len(visible_agents) or None,
+                "monster terlihat": len(visible_monsters) or None,
+                "ruin terlihat": len(visible_ruins) or None,
+                "alert gauge": new_self.get("alertGauge"),
+                "update type": f"{ftype} ({reason})" if reason else ftype,
+            })
+
+            # Equipment snapshot — weapon + inventory items, logged only when
+            # it actually changes so this doesn't spam every single turn.
+            equipped_weapon = new_self.get("equippedWeapon")
+            inventory_items = new_self.get("inventory") or []
+            equip_signature = json.dumps(
+                {"weapon": equipped_weapon, "inventory": inventory_items},
+                sort_keys=True,
+            )
+            if equip_signature != session.last_equipment_signature:
+                session.last_equipment_signature = equip_signature
+                item_lines = {
+                    it.get("name", f"item {i}"): f"x{it.get('quantity', 1)}"
+                    for i, it in enumerate(inventory_items)
+                }
+                weapon_name = (
+                    equipped_weapon.get("name") if isinstance(equipped_weapon, dict)
+                    else equipped_weapon
+                )
+                log_info_block("Equipment", {
+                    "weapon": weapon_name or "(kosong)",
+                    **(item_lines or {"item": "(kosong)"}),
+                })
             # Diagnostic: if HP dropped since the last view and it wasn't
             # from an attack we just sent, dump the raw self + region block
             # so the actual damage source (death zone, weather, guardian,
@@ -613,9 +685,10 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
     if decision.kind == "attack" and current_target:
         # Redirect only when we have a real reason to believe repeating is
         # pointless: the target was already confirmed dead (TARGET_DEAD),
-        # or its HP hasn't moved since our last hit on it (stuck/miss loop).
-        # Otherwise, an alive target that's taking damage is exactly what
-        # we WANT to keep hitting to actually close out the kill.
+        # its HP hasn't moved since our last hit (miss/blocked — no damage
+        # landed), or its HP went UP (regenerating/healing faster than we
+        # can damage it). Otherwise, an alive target that's taking damage
+        # is exactly what we WANT to keep hitting to close out the kill.
         target_confirmed_dead = current_target in session.confirmed_dead_targets
         current_target_hp = get_target_current_hp(view, current_target)
         previously_seen_hp = session.last_seen_target_hp.get(current_target)
@@ -623,30 +696,40 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
             current_target == session.last_action_target
             and session.last_decision_kind == "attack"
         )
-        stuck_no_damage_dealt = (
+        no_damage_landed = (
             is_same_target_as_last_attack
             and previously_seen_hp is not None
             and current_target_hp is not None
-            and current_target_hp >= previously_seen_hp
+            and current_target_hp == previously_seen_hp
+        )
+        target_healing = (
+            is_same_target_as_last_attack
+            and previously_seen_hp is not None
+            and current_target_hp is not None
+            and current_target_hp > previously_seen_hp
         )
 
-        if target_confirmed_dead or stuck_no_damage_dealt:
+        if target_confirmed_dead or no_damage_landed or target_healing:
             log.warning(
                 "redirecting away from attack target=%s (confirmedDead=%s "
-                "stuckNoDamage=%s prevHp=%s curHp=%s) hp=%s",
-                current_target, target_confirmed_dead, stuck_no_damage_dealt,
-                previously_seen_hp, current_target_hp, hp,
+                "noDamageLanded=%s targetHealing=%s prevHp=%s curHp=%s ep=%s) "
+                "— last attack payload sent was targeting this same id; if "
+                "this keeps happening, the attack action may not be landing "
+                "damage at all (payload field names may need adjusting)",
+                current_target, target_confirmed_dead, no_damage_landed,
+                target_healing, previously_seen_hp, current_target_hp,
+                self_state.get("ep"),
             )
             connections = (view.get("currentRegion") or {}).get("connections") or []
             if connections:
                 decision = Decision(
                     kind="move",
                     target_region_id=random.choice(connections),
-                    reason="redirecting off a dead/stuck attack target",
+                    reason="redirecting off a dead/stuck/healing attack target",
                 )
                 current_target = None
             else:
-                decision = Decision(kind="wait", reason="dead/stuck target, no exit")
+                decision = Decision(kind="wait", reason="dead/stuck/healing target, no exit")
                 current_target = None
         else:
             if current_target_hp is not None:
@@ -694,10 +777,18 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
     session.last_decision_kind = decision.kind
 
     payload = build_action_payload(decision)
-    log.info(
-        "decision=%s reason=%r hp=%s payload=%s",
-        decision.kind, decision.reason, hp, payload,
+    target_display = (
+        decision.target_region_id
+        or decision.target_agent_id
+        or decision.target_monster_id
+        or decision.ruin_id
     )
+    log_info_block("Aksi", {
+        "action": decision.kind,
+        "target": target_display,
+        "alasan": decision.reason,
+        "hp saat ini": hp,
+    })
 
     await ws.send(json.dumps(payload))
 
@@ -821,10 +912,17 @@ async def main_loop() -> None:
 
         try:
             me = await rest.get_me()
-            log.info(
-                "account name=%s balance=%s readiness=%s",
-                me.get("name"), me.get("balance"), me.get("readiness"),
-            )
+            readiness = me.get("readiness", {}) or {}
+            log_info_block("Akun", {
+                "nama": me.get("name"),
+                "balance": f"{me.get('balance')} sMoltz",
+                "wallet ok": readiness.get("walletAddress"),
+                "whitelist": readiness.get("whitelistApproved"),
+                "SC wallet": readiness.get("scWallet"),
+                "identity": readiness.get("identity"),
+                "sMoltz cukup": readiness.get("sMoltzSufficient"),
+                "paid ready": readiness.get("paidReady"),
+            })
         except ApiError as e:
             log.error("could not fetch account — check CLAW_API_KEY: %s", e)
             sys.exit(1)
