@@ -430,6 +430,8 @@ class GameSession:
     last_decision_kind: Optional[str] = None
     last_action_target: Optional[str] = None  # ruinId, targetAgentId, or targetMonsterId
     consecutive_same_target: int = 0
+    confirmed_dead_targets: set = field(default_factory=set)
+    last_seen_target_hp: dict = field(default_factory=dict)  # targetId -> hp
 
 
 async def send_hello(ws, entry_type: str) -> None:
@@ -517,10 +519,21 @@ async def play_session(ws, session: GameSession) -> str:
             if can_act is not None:
                 session.can_act = can_act
             cooldown_ms = frame.get("cooldownRemainingMs")
+            error = frame.get("error") or {}
             log.info(
                 "action_result success=%s canAct=%s cooldownRemainingMs=%s error=%s",
-                success, can_act, cooldown_ms, frame.get("error"),
+                success, can_act, cooldown_ms, error,
             )
+            # TARGET_DEAD (1.15.0) is the authoritative "that target is
+            # already dead" signal — distinct from AGENT_DEAD (our own
+            # death). Remember it so the repeat-attack guard can retarget
+            # instead of blindly refusing every repeat.
+            if error.get("code") == "TARGET_DEAD" and session.last_action_target:
+                session.confirmed_dead_targets.add(session.last_action_target)
+                log.info(
+                    "target=%s confirmed dead via TARGET_DEAD",
+                    session.last_action_target,
+                )
             # Some server versions attach a fresh view directly on the
             # action_result frame itself — capture it if present so the
             # next decision isn't made from a stale cached view.
@@ -560,6 +573,18 @@ async def play_session(ws, session: GameSession) -> str:
     return "closed"
 
 
+def get_target_current_hp(view: dict, target_id: str) -> Optional[int]:
+    """Look up a target's current HP from visibleAgents/visibleMonsters by id,
+    so the attack-repeat guard can tell if a previous hit actually landed."""
+    for a in (view.get("visibleAgents") or []):
+        if a.get("id") == target_id:
+            return a.get("hp")
+    for m in (view.get("visibleMonsters") or []):
+        if m.get("id") == target_id:
+            return m.get("hp")
+    return None
+
+
 async def maybe_act(ws, session: GameSession, view: dict) -> None:
     if not view:
         return
@@ -581,48 +606,90 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
 
     decision = decide(view)
 
-    # Safety brake: never re-send the exact same explore/attack on the exact
-    # same target twice in a row without an intervening turn actually
-    # advancing. Root cause this guards against: can_act_changed firing
-    # while canAct flips back True lets the loop re-decide against a view
-    # that hasn't meaningfully changed (e.g. a monster/ruin id the previous
-    # action already resolved against), so the bot blindly repeats the same
-    # action on a target that may already be dead/depleted, or walks into a
-    # worse ambush than the first attempt.
     current_target = (
         decision.ruin_id or decision.target_monster_id or decision.target_agent_id
     )
-    repeatable_kinds = {"explore", "attack"}
 
-    if decision.kind in repeatable_kinds and current_target:
-        if (
+    if decision.kind == "attack" and current_target:
+        # Redirect only when we have a real reason to believe repeating is
+        # pointless: the target was already confirmed dead (TARGET_DEAD),
+        # or its HP hasn't moved since our last hit on it (stuck/miss loop).
+        # Otherwise, an alive target that's taking damage is exactly what
+        # we WANT to keep hitting to actually close out the kill.
+        target_confirmed_dead = current_target in session.confirmed_dead_targets
+        current_target_hp = get_target_current_hp(view, current_target)
+        previously_seen_hp = session.last_seen_target_hp.get(current_target)
+        is_same_target_as_last_attack = (
             current_target == session.last_action_target
-            and session.last_decision_kind == decision.kind
-        ):
-            session.consecutive_same_target += 1
-        else:
-            session.consecutive_same_target = 0
-        session.last_action_target = current_target
+            and session.last_decision_kind == "attack"
+        )
+        stuck_no_damage_dealt = (
+            is_same_target_as_last_attack
+            and previously_seen_hp is not None
+            and current_target_hp is not None
+            and current_target_hp >= previously_seen_hp
+        )
 
-        if session.consecutive_same_target >= 1:
+        if target_confirmed_dead or stuck_no_damage_dealt:
             log.warning(
-                "refusing to repeat %s on target=%s again without a fresh "
-                "turn (hp=%s) — falling back to repositioning instead",
-                decision.kind, current_target, hp,
+                "redirecting away from attack target=%s (confirmedDead=%s "
+                "stuckNoDamage=%s prevHp=%s curHp=%s) hp=%s",
+                current_target, target_confirmed_dead, stuck_no_damage_dealt,
+                previously_seen_hp, current_target_hp, hp,
             )
             connections = (view.get("currentRegion") or {}).get("connections") or []
             if connections:
                 decision = Decision(
                     kind="move",
                     target_region_id=random.choice(connections),
-                    reason=f"breaking repeated-{decision.kind} loop for safety",
+                    reason="redirecting off a dead/stuck attack target",
+                )
+                current_target = None
+            else:
+                decision = Decision(kind="wait", reason="dead/stuck target, no exit")
+                current_target = None
+        else:
+            if current_target_hp is not None:
+                session.last_seen_target_hp[current_target] = current_target_hp
+            session.last_action_target = current_target
+
+    # Explore still uses a simple one-repeat block: ruins don't expose an
+    # HP-style signal to confirm progress, so we can't tell "still working
+    # on it" from "stuck" the way we can for attack. Repeating the exact
+    # same explore on the exact same ruin twice in a row is still refused.
+    elif decision.kind == "explore" and current_target:
+        if (
+            current_target == session.last_action_target
+            and session.last_decision_kind == "explore"
+        ):
+            session.consecutive_same_target += 1
+        else:
+            session.consecutive_same_target = 0
+
+        if session.consecutive_same_target >= 1:
+            log.warning(
+                "refusing to repeat explore on target=%s again without a fresh "
+                "turn (hp=%s) — falling back to repositioning instead",
+                current_target, hp,
+            )
+            connections = (view.get("currentRegion") or {}).get("connections") or []
+            if connections:
+                decision = Decision(
+                    kind="move",
+                    target_region_id=random.choice(connections),
+                    reason="breaking repeated-explore loop for safety",
                 )
             else:
                 decision = Decision(kind="wait", reason="breaking repeat loop, no exit")
             session.consecutive_same_target = 0
+            session.last_action_target = None
+        else:
+            session.last_action_target = current_target
     else:
+        # move/wait/other kinds don't carry a repeatable target — leave
+        # last_action_target as-is so a subsequent attack/explore decision
+        # can still be compared against the last REAL target we acted on.
         session.consecutive_same_target = 0
-        session.last_action_target = None
 
     session.last_decision_kind = decision.kind
 
