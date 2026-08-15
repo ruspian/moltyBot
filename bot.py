@@ -315,14 +315,21 @@ def decide(view: dict) -> Decision:
             )
 
     # 2) Low HP -> disengage and retreat rather than fight, since survival
-    #    time outranks kills in the current ranking rules.
-    if hp_ratio < 0.35:
-        threats = [a for a in visible_agents if not a.get("isGuardian")]
-        if threats and connections:
+    #    time outranks kills in the current ranking rules. This must fire
+    #    regardless of WHY hp is low (agent damage, monster counter-hit,
+    #    zone/weather tick) — critical HP always means "get out", not just
+    #    when a hostile agent happens to be visible.
+    if hp_ratio < 0.40:
+        if connections:
             return Decision(
                 kind="move",
                 target_region_id=random.choice(connections),
-                reason=f"low HP ({hp_ratio:.0%}) — retreating from contested region",
+                reason=f"critical HP ({hp_ratio:.0%}) — retreating unconditionally",
+            )
+        else:
+            return Decision(
+                kind="wait",
+                reason=f"critical HP ({hp_ratio:.0%}) but no connections to flee to",
             )
 
     # 3) Healthy and a weak, isolated target is adjacent -> only then
