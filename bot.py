@@ -140,7 +140,13 @@ class RestClient:
         raise ApiError(426, "VERSION_MISMATCH", "failed after retry")
 
     async def get_me(self) -> dict:
-        return await self.request("GET", "/accounts/me")
+        data = await self.request("GET", "/accounts/me")
+        # Some deployments wrap this in {"success": true, "data": {...}},
+        # others return MeResponse fields at the top level directly.
+        # Handle both without guessing wrong every time.
+        if "data" in data and isinstance(data.get("data"), dict) and "name" not in data:
+            return data["data"]
+        return data
 
     async def get_loadout(self) -> dict:
         return await self.request("GET", "/loadout")
@@ -352,16 +358,20 @@ def decide(view: dict) -> Decision:
     if in_cave:
         return Decision(kind="wait", reason="in cave — awaiting explicit exit handling")
 
-    # 6) A ruin is nearby and not yet at max alert -> explore it for
-    #    relics/packs; back off once alertActive is a real risk.
+    # 6) A ruin is nearby and alert risk is low -> explore it for
+    #    relics/packs. Each explore raises alertGauge +2 (+4 more on full
+    #    clear); at gauge 10 guardians actively hunt you. Back off well
+    #    before alertActive actually triggers, and require more HP margin
+    #    than other actions since a ruin ambush can hit hard.
     alert_active = self_state.get("alertActive", False)
-    if visible_ruins and not alert_active and hp_ratio >= 0.5:
+    alert_gauge = self_state.get("alertGauge", 0) or 0
+    if visible_ruins and not alert_active and alert_gauge <= 4 and hp_ratio >= 0.7:
         ruin = next((r for r in visible_ruins if not r.get("isEmpty")), None)
         if ruin:
             return Decision(
                 kind="explore",
                 ruin_id=ruin.get("ruinId"),
-                reason="exploring non-empty ruin while alert is safe",
+                reason=f"exploring ruin (alertGauge={alert_gauge}, hp={hp_ratio:.0%})",
             )
 
     # 7) Nothing urgent -> reposition toward an unexplored-looking
@@ -409,6 +419,10 @@ class GameSession:
     alive: bool = True
     game_id: Optional[str] = None
     last_view: dict = field(default_factory=dict)
+    last_view_turn: Optional[int] = None
+    last_decision_kind: Optional[str] = None
+    last_explore_ruin_id: Optional[str] = None
+    consecutive_same_explore: int = 0
 
 
 async def send_hello(ws, entry_type: str) -> None:
@@ -448,13 +462,26 @@ async def play_session(ws, session: GameSession) -> str:
         elif ftype in ("agent_view", "turn_advanced", "handover_sync"):
             view = frame.get("view", {})
             session.last_view = view
-            turn = frame.get("turn")
+            session.last_view_turn = frame.get("turn")
             reason = frame.get("reason")
             log.info(
                 "state update type=%s reason=%s turn=%s hp=%s canAct=%s",
-                ftype, reason, turn,
+                ftype, reason, session.last_view_turn,
                 (view.get("self") or {}).get("hp"),
                 session.can_act,
+            )
+            await maybe_act(ws, session, view)
+
+        elif ftype == "action_rejected":
+            # Same frame shape as agent_view/turn_advanced but tagged as a
+            # failed-action snapshot (1.15.0). Treat identically — it is
+            # the authoritative state at this moment, action was refused.
+            view = frame.get("view", {})
+            session.last_view = view
+            session.last_view_turn = frame.get("turn")
+            log.info(
+                "action_rejected — refreshed state turn=%s hp=%s",
+                session.last_view_turn, (view.get("self") or {}).get("hp"),
             )
             await maybe_act(ws, session, view)
 
@@ -468,6 +495,13 @@ async def play_session(ws, session: GameSession) -> str:
                 "action_result success=%s canAct=%s cooldownRemainingMs=%s error=%s",
                 success, can_act, cooldown_ms, frame.get("error"),
             )
+            # Some server versions attach a fresh view directly on the
+            # action_result frame itself — capture it if present so the
+            # next decision isn't made from a stale cached view.
+            inline_view = frame.get("view")
+            if inline_view:
+                session.last_view = inline_view
+                session.last_view_turn = frame.get("turn", session.last_view_turn)
 
         elif ftype == "can_act_changed":
             session.can_act = frame.get("canAct", True)
@@ -508,6 +542,8 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
     if self_state.get("isAlive") is False:
         return
 
+    hp = self_state.get("hp")
+
     # Free actions (talk/whisper) go BEFORE the main action and never
     # consume the turn — placeholder hook, extend with real chat logic
     # if you want the agent to communicate.
@@ -518,8 +554,49 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
         return
 
     decision = decide(view)
+
+    # Safety brake: never re-send the exact same explore on the exact same
+    # ruin more than once without an intervening turn actually advancing.
+    # Root cause this guards against: can_act_changed firing while the
+    # cached view hadn't been refreshed yet led the bot to blindly repeat
+    # `explore` on a ruin whose alert/ambush risk had already changed,
+    # costing large HP between two "identical" decisions.
+    if decision.kind == "explore" and decision.ruin_id:
+        if (
+            decision.ruin_id == session.last_explore_ruin_id
+            and session.last_decision_kind == "explore"
+        ):
+            session.consecutive_same_explore += 1
+        else:
+            session.consecutive_same_explore = 0
+        session.last_explore_ruin_id = decision.ruin_id
+
+        if session.consecutive_same_explore >= 1:
+            log.warning(
+                "refusing to repeat explore on ruin=%s again without a fresh "
+                "turn (hp=%s) — falling back to repositioning instead",
+                decision.ruin_id, hp,
+            )
+            connections = (view.get("currentRegion") or {}).get("connections") or []
+            if connections:
+                decision = Decision(
+                    kind="move",
+                    target_region_id=random.choice(connections),
+                    reason="breaking repeated-explore loop for safety",
+                )
+            else:
+                decision = Decision(kind="wait", reason="breaking repeated-explore loop, no exit")
+            session.consecutive_same_explore = 0
+    else:
+        session.consecutive_same_explore = 0
+
+    session.last_decision_kind = decision.kind
+
     payload = build_action_payload(decision)
-    log.info("decision=%s reason=%r payload=%s", decision.kind, decision.reason, payload)
+    log.info(
+        "decision=%s reason=%r hp=%s payload=%s",
+        decision.kind, decision.reason, hp, payload,
+    )
 
     await ws.send(json.dumps(payload))
 
