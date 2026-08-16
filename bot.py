@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Claw Royale agent bot.
-(Aggressive Mode: Fast Pickup, Equip Best Weapon, NO RETREAT)
+(Aggressive Mode: Flash Looting, Equip Best Weapon, NO RETREAT)
 """
 
 from __future__ import annotations
@@ -184,7 +184,7 @@ def is_cooldown_action(kind: str) -> bool:
 
 
 def decide_free_actions(view: dict) -> list[Decision]:
-    """Menentukan Free Actions (0 Cooldown). Dioptimalkan agar nge-loot lebih agresif dan cerdas pilih senjata."""
+    """Menentukan Free Actions (0 Cooldown). Dioptimalkan untuk FAST LOOTING & SMART EQUIP."""
     free_decisions = []
     self_state = view.get("self", {}) or {}
     inventory = self_state.get("inventory") or []
@@ -193,19 +193,16 @@ def decide_free_actions(view: dict) -> list[Decision]:
     # 1. AUTO-EQUIP SENJATA TERBAIK
     all_weapons = [i for i in inventory if i.get("category") == "weapon"]
     
-    # Jika sudah punya senjata, gabungkan ke dalam pool seleksi
     if equipped_weapon:
         if isinstance(equipped_weapon, dict) and equipped_weapon.get("category") == "weapon":
             all_weapons.append(equipped_weapon)
 
     if all_weapons:
-        # Fungsi penilai senjata: cari atribut damage/atk paling besar
         def weapon_score(w):
             return w.get("damage", 0) or w.get("atk", 0) or w.get("power", 0) or 0
         
         best_weapon = max(all_weapons, key=weapon_score)
         
-        # Cek apakah senjata terbaik INI sudah dipakai atau belum
         is_already_equipped = False
         if equipped_weapon:
             if isinstance(equipped_weapon, dict) and equipped_weapon.get("id") == best_weapon.get("id"):
@@ -213,7 +210,6 @@ def decide_free_actions(view: dict) -> list[Decision]:
             elif isinstance(equipped_weapon, str) and equipped_weapon == best_weapon.get("id"):
                 is_already_equipped = True
                 
-        # Jika belum dipakai, EQUIP!
         if not is_already_equipped and best_weapon.get("id"):
             dmg = weapon_score(best_weapon)
             free_decisions.append(Decision(
@@ -222,23 +218,29 @@ def decide_free_actions(view: dict) -> list[Decision]:
                 reason=f"auto-equip senjata TERKUAT: {best_weapon.get('name')} (Power: {dmg})"
             ))
 
-    # 2. AUTO-PICKUP (Ambil Barang Sekitar Sepenuh Mungkin)
-    visible_items = view.get("visibleItems") or []
+    # 2. FAST AUTO-PICKUP (Sapu Bersih Lootingan)
+    # Memindai seluruh key JSON yang mungkin menyimpan barang di tanah (antisipasi update server)
+    raw_visible_items = []
+    if isinstance(view.get("visibleItems"), list):
+        raw_visible_items.extend(view.get("visibleItems"))
+        
     current_region = view.get("currentRegion") or {}
+    for key in ["items", "groundItems", "droppedItems"]:
+        if isinstance(current_region.get(key), list):
+            raw_visible_items.extend(current_region.get(key))
+
+    # Hapus duplikat berdasarkan ID agar tidak spam error
+    unique_items = {item.get("id"): item for item in raw_visible_items if item.get("id")}
     
-    # Cek opsi field ground items lainnya jika visibleItems kosong
-    if not visible_items:
-        visible_items = current_region.get("items") or current_region.get("groundItems") or []
-    
-    if visible_items:
+    if unique_items:
         inv_count = len(inventory)
-        for item in visible_items:
+        for item_id, item in unique_items.items():
             if inv_count >= 10:
                 break # Mentok 10 slot max
             free_decisions.append(Decision(
                 kind="pickup",
-                item_id=item.get("id"),
-                reason=f"auto-pickup mengambil barang: {item.get('name', 'Unknown Item')}"
+                item_id=item_id,
+                reason=f"⚡ FAST LOOT: Mengambil barang {item.get('name', 'Unknown Item')}"
             ))
             inv_count += 1
             
@@ -269,7 +271,7 @@ def decide(view: dict) -> Decision:
         if safe_targets:
             return Decision(kind="move", target_region_id=random.choice(safe_targets), reason="evacuating death zone")
 
-    # 1.5) Auto-heal - Diturunkan ke 60% supaya bot lebih fokus nyerang daripada sibuk heal
+    # 1.5) Auto-heal
     inventory_items = self_state.get("inventory") or []
     recovery_items = [i for i in inventory_items if i.get("category") == "recovery"]
     if hp_ratio < 0.60 and recovery_items:
@@ -279,7 +281,6 @@ def decide(view: dict) -> Decision:
 
     # ==========================================
     # MODE BARBAR: POKOKNYA ATTACK KALAU ADA MUSUH
-    # (Logika kabur/retreat dihapus sepenuhnya)
     # ==========================================
 
     # 2) Serang Agent (Pemain Lain)
@@ -303,15 +304,15 @@ def decide(view: dict) -> Decision:
             return Decision(kind="interact", interactable_id=facilities[0].get("id"), reason="using facility to exit cave")
         return Decision(kind="interact", reason="in cave — attempting generic interact to exit")
 
-    # 5) Explore Ruin (Kalau map kosong)
+    # 5) Explore Ruin (Mencari loot jika sedang kosong)
     alert_active = self_state.get("alertActive", False)
     alert_gauge = self_state.get("alertGauge", 0) or 0
-    if visible_ruins and not alert_active and alert_gauge <= 6: # Ditingkatkan ke 6 supaya lebih berani
+    if visible_ruins and not alert_active and alert_gauge <= 6:
         ruin = next((r for r in visible_ruins if not r.get("isEmpty")), None)
         if ruin:
             return Decision(kind="explore", ruin_id=ruin.get("ruinId"), reason=f"exploring ruin (alertGauge={alert_gauge})")
 
-    # 6) Hunting - Reposisi cari musuh jika sedang idle
+    # 6) Hunting - Reposisi cari musuh/loot jika sedang idle
     if connections:
         return Decision(kind="move", target_region_id=random.choice(connections), reason="Hunting: mencari musuh/loot di region lain")
 
@@ -403,7 +404,7 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
 
     hp = self_state.get("hp")
 
-    # ----- PROSES FREE ACTIONS (Pickup, Equip) -----
+    # ----- PROSES FREE ACTIONS (Flash Looting & Equip) -----
     free_actions = decide_free_actions(view)
     for fd in free_actions:
         payload = build_action_payload(fd)
@@ -413,8 +414,8 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
             "alasan": fd.reason
         })
         await ws.send(json.dumps(payload))
-        # Jeda dipersingkat dari 0.3 ke 0.05 agar ngambil barangnya ngebut layaknya bot pro!
-        await asyncio.sleep(0.05) 
+        # Jeda super cepat 0.01 detik agar server tidak pusing tapi barang kesapu bersih
+        await asyncio.sleep(0.01) 
 
     # ----- PROSES MAIN ACTION (Cooldown Group) -----
     if not session.can_act:
@@ -528,8 +529,6 @@ async def play_session(ws, session: GameSession) -> str:
                     moved_from = session.region_before_last_move
                     if current_region_id == moved_from:
                         session.consecutive_failed_moves += 1
-                        if session.consecutive_failed_moves >= 3:
-                            pass
                     else:
                         session.consecutive_failed_moves = 0
                     session.last_move_target_region = None
@@ -616,8 +615,6 @@ async def run_one_game(rest: RestClient, entry_type: str) -> str:
         "X-API-Key": rest.api_key,
         "X-Version": rest.version,
     }
-
-    join_started_at = time.monotonic()
 
     try:
         async with websockets.connect(
