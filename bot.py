@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Claw Royale agent bot.
-(Updated with Free Actions: pickup, equip, talk, whisper, broadcast, interact)
+(Aggressive Mode: Fast Pickup, Equip Best Weapon, NO RETREAT)
 """
 
 from __future__ import annotations
@@ -180,32 +180,54 @@ class Decision:
 
 
 def is_cooldown_action(kind: str) -> bool:
-    """Action yang memicu cooldown 30s dan mengkonsumsi EP (atau turn)."""
     return kind in {"move", "attack", "explore", "use_item", "interact", "wait", "rest"}
 
 
 def decide_free_actions(view: dict) -> list[Decision]:
-    """Menentukan Free Actions (0 Cooldown) sebelum melakukan action utama.
-    Berguna untuk otomatis ambil barang (pickup) atau memakai item (equip)."""
+    """Menentukan Free Actions (0 Cooldown). Dioptimalkan agar nge-loot lebih agresif dan cerdas pilih senjata."""
     free_decisions = []
     self_state = view.get("self", {}) or {}
     inventory = self_state.get("inventory") or []
-    
-    # 1. AUTO-EQUIP: Jika tidak pakai senjata dan ada senjata di inventory, otomatis pakai.
     equipped_weapon = self_state.get("equippedWeapon")
-    if not equipped_weapon:
-        weapons = [i for i in inventory if i.get("category") == "weapon"]
-        if weapons:
+    
+    # 1. AUTO-EQUIP SENJATA TERBAIK
+    all_weapons = [i for i in inventory if i.get("category") == "weapon"]
+    
+    # Jika sudah punya senjata, gabungkan ke dalam pool seleksi
+    if equipped_weapon:
+        if isinstance(equipped_weapon, dict) and equipped_weapon.get("category") == "weapon":
+            all_weapons.append(equipped_weapon)
+
+    if all_weapons:
+        # Fungsi penilai senjata: cari atribut damage/atk paling besar
+        def weapon_score(w):
+            return w.get("damage", 0) or w.get("atk", 0) or w.get("power", 0) or 0
+        
+        best_weapon = max(all_weapons, key=weapon_score)
+        
+        # Cek apakah senjata terbaik INI sudah dipakai atau belum
+        is_already_equipped = False
+        if equipped_weapon:
+            if isinstance(equipped_weapon, dict) and equipped_weapon.get("id") == best_weapon.get("id"):
+                is_already_equipped = True
+            elif isinstance(equipped_weapon, str) and equipped_weapon == best_weapon.get("id"):
+                is_already_equipped = True
+                
+        # Jika belum dipakai, EQUIP!
+        if not is_already_equipped and best_weapon.get("id"):
+            dmg = weapon_score(best_weapon)
             free_decisions.append(Decision(
                 kind="equip", 
-                item_id=weapons[0].get("id"), 
-                reason=f"auto-equip senjata dari inventory: {weapons[0].get('name')}"
+                item_id=best_weapon.get("id"), 
+                reason=f"auto-equip senjata TERKUAT: {best_weapon.get('name')} (Power: {dmg})"
             ))
 
-    # 2. AUTO-PICKUP: Jika ada barang nganggur di map, otomatis ambil.
+    # 2. AUTO-PICKUP (Ambil Barang Sekitar Sepenuh Mungkin)
     visible_items = view.get("visibleItems") or []
+    current_region = view.get("currentRegion") or {}
+    
+    # Cek opsi field ground items lainnya jika visibleItems kosong
     if not visible_items:
-        current_region = view.get("currentRegion") or {}
         visible_items = current_region.get("items") or current_region.get("groundItems") or []
     
     if visible_items:
@@ -224,7 +246,7 @@ def decide_free_actions(view: dict) -> list[Decision]:
 
 
 def decide(view: dict) -> Decision:
-    """Action Utama (Cooldown Action)."""
+    """Action Utama (Cooldown Action) - MODE BARBAR, TANPA TAKUT"""
     self_state = view.get("self", {}) or {}
     hp = self_state.get("hp", 100)
     max_hp_guess = self_state.get("maxHp", 100) or 100
@@ -240,70 +262,63 @@ def decide(view: dict) -> Decision:
 
     hp_ratio = hp / max_hp_guess if max_hp_guess else 1.0
 
-    # 1) Evakuasi Death Zone
+    # 1) Evakuasi Death Zone (Satu-satunya alasan bot boleh kabur)
     pending_here_ids = {dz.get("id") for dz in pending_deathzones}
     if is_death_zone or current_region.get("id") in pending_here_ids:
         safe_targets = [c for c in connections]
         if safe_targets:
             return Decision(kind="move", target_region_id=random.choice(safe_targets), reason="evacuating death zone")
 
-    # 1.5) Auto-heal 
+    # 1.5) Auto-heal - Diturunkan ke 60% supaya bot lebih fokus nyerang daripada sibuk heal
     inventory_items = self_state.get("inventory") or []
     recovery_items = [i for i in inventory_items if i.get("category") == "recovery"]
-    if hp_ratio < 0.75 and recovery_items:
+    if hp_ratio < 0.60 and recovery_items:
         best_item = max(recovery_items, key=lambda i: i.get("hpRestore", 0))
         if best_item.get("hpRestore", 0) > 0:
-            return Decision(kind="use_item", item_id=best_item.get("id"), reason=f"auto-heal: using {best_item.get('name')} (hp={hp_ratio:.0%})")
+            return Decision(kind="use_item", item_id=best_item.get("id"), reason=f"auto-heal: using {best_item.get('name')}")
 
-    # 1.6) Hindari Kerumunan
-    CROWDED_THRESHOLD = 10
-    if len(visible_agents) > CROWDED_THRESHOLD and connections:
-        return Decision(kind="move", target_region_id=random.choice(connections), reason="crowded region — evacuating")
+    # ==========================================
+    # MODE BARBAR: POKOKNYA ATTACK KALAU ADA MUSUH
+    # (Logika kabur/retreat dihapus sepenuhnya)
+    # ==========================================
 
-    # 2) Kabur jika HP sekarat
-    if hp_ratio < 0.40:
-        if connections:
-            return Decision(kind="move", target_region_id=random.choice(connections), reason=f"critical HP ({hp_ratio:.0%}) — retreating")
-        else:
-            return Decision(kind="wait", reason=f"critical HP ({hp_ratio:.0%}) but no connections to flee")
-
-    # 3) Serang Target Lemah (Agent)
-    if hp_ratio >= 0.6 and visible_agents:
+    # 2) Serang Agent (Pemain Lain)
+    if visible_agents and ep > 0:
         non_guardian = [a for a in visible_agents if not a.get("isGuardian")]
         if non_guardian:
             weakest = min(non_guardian, key=lambda a: a.get("hp", 999))
-            if weakest.get("hp", 999) <= hp * 0.7 and ep > 0:
-                return Decision(kind="attack", target_agent_id=weakest.get("id"), reason="engaging weaker isolated target")
-
-    # 4) Serang Monster
-    if hp_ratio >= 0.5 and visible_monsters and ep > 0:
+            return Decision(kind="attack", target_agent_id=weakest.get("id"), reason="MODE BARBAR: Menghajar Agent terlemah di map!")
+            
+    # 3) Serang Monster (Kalau ga ada Agent)
+    if visible_monsters and ep > 0:
         weakest_monster = min(visible_monsters, key=lambda m: m.get("hp", 999))
-        return Decision(kind="attack", target_monster_id=weakest_monster.get("id"), reason="clearing a weak monster for loot/reward")
+        return Decision(kind="attack", target_monster_id=weakest_monster.get("id"), reason="MODE BARBAR: Menghabisi Monster untuk loot!")
 
-    # 5) Didalam Cave -> Gunakan "interact" untuk berinteraksi dengan exit facility
+    # ==========================================
+
+    # 4) Didalam Cave -> Gunakan "interact" untuk keluar
     if in_cave:
         facilities = view.get("visibleFacilities") or current_region.get("facilities") or []
         if facilities:
             return Decision(kind="interact", interactable_id=facilities[0].get("id"), reason="using facility to exit cave")
         return Decision(kind="interact", reason="in cave — attempting generic interact to exit")
 
-    # 6) Explore Ruin
+    # 5) Explore Ruin (Kalau map kosong)
     alert_active = self_state.get("alertActive", False)
     alert_gauge = self_state.get("alertGauge", 0) or 0
-    if visible_ruins and not alert_active and alert_gauge <= 4 and hp_ratio >= 0.7:
+    if visible_ruins and not alert_active and alert_gauge <= 6: # Ditingkatkan ke 6 supaya lebih berani
         ruin = next((r for r in visible_ruins if not r.get("isEmpty")), None)
         if ruin:
             return Decision(kind="explore", ruin_id=ruin.get("ruinId"), reason=f"exploring ruin (alertGauge={alert_gauge})")
 
-    # 7) Reposisi jika idle
+    # 6) Hunting - Reposisi cari musuh jika sedang idle
     if connections:
-        return Decision(kind="move", target_region_id=random.choice(connections), reason="no immediate threat/opportunity — repositioning")
+        return Decision(kind="move", target_region_id=random.choice(connections), reason="Hunting: mencari musuh/loot di region lain")
 
     return Decision(kind="wait", reason="no connections and nothing to do")
 
 
 def build_action_payload(decision: Decision) -> dict:
-    """Mengubah format Decision menjadi WS Envelope sesuai dengan standar server baru."""
     data: dict[str, Any] = {}
 
     if decision.kind == "move" and decision.target_region_id:
@@ -388,7 +403,7 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
 
     hp = self_state.get("hp")
 
-    # ----- PROSES FREE ACTIONS DULU (Pickup, Equip, dll) -----
+    # ----- PROSES FREE ACTIONS (Pickup, Equip) -----
     free_actions = decide_free_actions(view)
     for fd in free_actions:
         payload = build_action_payload(fd)
@@ -398,7 +413,8 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
             "alasan": fd.reason
         })
         await ws.send(json.dumps(payload))
-        await asyncio.sleep(0.3)  # Delay kecil agar tidak spam websocket
+        # Jeda dipersingkat dari 0.3 ke 0.05 agar ngambil barangnya ngebut layaknya bot pro!
+        await asyncio.sleep(0.05) 
 
     # ----- PROSES MAIN ACTION (Cooldown Group) -----
     if not session.can_act:
@@ -417,7 +433,6 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
     decision = decide(working_view)
     current_target = decision.ruin_id or decision.target_monster_id or decision.target_agent_id
 
-    # Handle logic cegah nyangkut di target yang sudah mati/heal
     if decision.kind == "attack" and current_target:
         target_confirmed_dead = current_target in session.confirmed_dead_targets
         current_target_hp = get_target_current_hp(view, current_target)
@@ -514,7 +529,7 @@ async def play_session(ws, session: GameSession) -> str:
                     if current_region_id == moved_from:
                         session.consecutive_failed_moves += 1
                         if session.consecutive_failed_moves >= 3:
-                            pass # Hanya untuk menekan spam log
+                            pass
                     else:
                         session.consecutive_failed_moves = 0
                     session.last_move_target_region = None
