@@ -260,6 +260,8 @@ def is_cooldown_action(kind: str) -> bool:
 
 
 def decide(view: dict) -> Decision:
+    """Mode: Scavenger/Pemulung Cerdas. Fokus loot, jauhi siapapun jika HP tipis."""
+
     self_state = view.get("self", {}) or {}
     hp = self_state.get("hp", 100)
     max_hp_guess = self_state.get("maxHp", 100) or 100
@@ -286,7 +288,7 @@ def decide(view: dict) -> Decision:
                 reason="evakuasi dari death zone mutlak",
             )
 
-    # 2) MENGHINDARI PLAYER LAIN DENGAN CERDAS
+    # 2) MENGHINDARI PLAYER LAIN DENGAN CERDAS (Revisi Krusial)
     if visible_agents:
         # Jika HP bocor (<90%) ATAU ada 2 musuh lebih, langsung ngacir!
         if hp_ratio < 0.90 or len(visible_agents) >= 2:
@@ -310,9 +312,10 @@ def decide(view: dict) -> Decision:
         else:
             return Decision(kind="wait", reason="Sekarat tapi buntu")
 
-    # 4) PRIORITAS NGE-LOOT (Mulai berani eksplorasi jika ruangan aman)
+    # 4) PRIORITAS NGE-LOOT (Mode Mulung Aktif jika Aman)
     alert_active = self_state.get("alertActive", False)
     alert_gauge = self_state.get("alertGauge", 0) or 0
+    # Berani nge-loot selama HP masih di atas 30% dan alert masih rendah
     if visible_ruins and not alert_active and alert_gauge <= 4:
         ruin = next((r for r in visible_ruins if not r.get("isEmpty")), None)
         if ruin:
@@ -327,6 +330,7 @@ def decide(view: dict) -> Decision:
         non_guardian_targets = [a for a in visible_agents if not a.get("isGuardian")]
         if non_guardian_targets:
             weakest = min(non_guardian_targets, key=lambda a: a.get("hp", 999))
+            # Hanya nyerang kalau musuh HP-nya di bawah 30% dari HP bot kita
             if weakest.get("hp", 999) <= hp * 0.3 and ep > 0:
                 return Decision(
                     kind="attack",
@@ -348,12 +352,12 @@ def decide(view: dict) -> Decision:
     if in_cave:
         return Decision(kind="wait", reason="di dalam gua — menunggu interaksi")
 
-    # 8) REPOSITION (Cari ruin baru jika diam)
+    # 8) REPOSITION (Terus berjalan cari ruin baru jika diam)
     if connections:
         return Decision(
             kind="move",
             target_region_id=random.choice(connections),
-            reason="berpindah tempat mencari ruang kosong yang ada ruin",
+            reason="berpindah tempat mencari aman atau mencari ruin baru",
         )
 
     return Decision(kind="wait", reason="tidak ada jalan keluar")
@@ -479,7 +483,7 @@ async def play_session(ws, session: GameSession) -> str:
                     **(item_lines or {"item": "(kosong)"}),
                 })
             
-            # --- PERBAIKAN LOG WARNING HP DROP ---
+            # --- TAMPILAN BARU LOG WARNING HP DROP ---
             if (
                 prev_hp is not None
                 and new_hp is not None
@@ -509,9 +513,9 @@ async def play_session(ws, session: GameSession) -> str:
             
             error = frame.get("error") or {}
             
-            # --- PERBAIKAN LOG NOTIFIKASI LOOT ---
+            # --- LOG BARU NOTIFIKASI LOOT ---
             if session.last_decision_kind == "explore" and success:
-                log.info("💎 [SUKSES EKSPLORASI] Berhasil membongkar ruin! Cek log atau inventory di turn selanjutnya.")
+                log.info("💎 [SUKSES EKSPLORASI] Berhasil membongkar ruin! Cek log game untuk detail item.")
             elif not success:
                 log.warning(f"❌ [AKSI GAGAL] Sistem menolak aksi: {error.get('code')} - {error.get('message')}")
             
@@ -532,7 +536,7 @@ async def play_session(ws, session: GameSession) -> str:
         elif ftype == "log":
             msg = frame.get("message")
             if msg:
-                log.info(f"📢 INFO GAME: {msg}")
+                log.info(f"📢 LOG GAME: {msg}")
 
         elif ftype == "agent_died":
             meta = frame.get("meta", {}) or {}
@@ -601,7 +605,7 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
             and current_target_hp > previously_seen_hp
         )
 
-        # --- PERBAIKAN LOG WARNING SERANGAN GAGAL ---
+        # --- TAMPILAN BARU LOG SERANGAN GAGAL ---
         if target_confirmed_dead or no_damage_landed or target_healing:
             log_info_block("⚠️ SERANGAN GAGAL / TARGET KEBAL", {
                 "target id": current_target,
@@ -633,9 +637,11 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
         else:
             session.consecutive_same_target = 0
 
-        # --- PERBAIKAN LOG WARNING RUIN NYANGKUT ---
+        # --- TAMPILAN BARU LOG RUIN NYANGKUT ---
         if session.consecutive_same_target >= 1:
             log_info_block("⚠️ RUIN NYANGKUT ATAU HABIS", {
+                "target id": current_target,
+                "alasan": "Ruin kosong, nge-bug, atau bot stuck",
                 "tindakan": "Menghindari loop eksploitasi, otomatis pindah area."
             })
             connections = (view.get("currentRegion") or {}).get("connections") or []
@@ -703,7 +709,7 @@ async def run_one_game(rest: RestClient, entry_type: str) -> str:
     except ConnectionClosed as e:
         waited = time.monotonic() - join_started_at
         if e.code == 1006 and waited < 120:
-            log.info("Menunggu matchmaking... (Timeout biasa dari server, akan retry otomatis)")
+            log.info("WebSocket closed 1006 (matchmaking timeout biasa), retrying...")
         elif e.code == 1013:
             return "resume_dead"
         elif e.code == 4032:
@@ -767,6 +773,7 @@ async def main_loop() -> None:
                 "nama": me.get("name"),
                 "balance": f"{me.get('balance')} sMoltz",
                 "wallet ok": readiness.get("walletAddress"),
+                "SC wallet": readiness.get("scWallet"),
                 "sMoltz cukup": readiness.get("sMoltzSufficient"),
                 "paid ready": readiness.get("paidReady"),
             })
