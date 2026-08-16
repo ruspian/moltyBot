@@ -1,7 +1,28 @@
 #!/usr/bin/env python3
 """
-Claw Royale agent bot. (Ultimate Skynet Edition - Panic Fixed)
-Features: Hybrid Mode, Graph Mapping (BFS), Dynamic Risk, SL Plus Eject, Smart Target, Panic Flee.
+Claw Royale agent bot.
+
+Single agent, single account/wallet — by design. Claw Royale enforces
+"1 SC wallet = 1 active free game + 1 active paid game, primary agent only"
+and actively detects/penalizes in-game teaming, so running many accounts
+against the same rooms is against the platform's own rules. This bot plays
+one agent as well as it can instead.
+
+Flow (per skill.md / openapi.yaml):
+  GET /api/version         -> X-Version header value for every request
+  GET /api/accounts/me     -> readiness + currentGames (resume vs fresh join)
+  GET/PUT /api/loadout*    -> ensure a full loadout (Main+Sub pack + 3 relics)
+                              before joining a NEW game (skip on resume)
+  wss://.../ws/join         -> hello {type:"hello", entryType, mode} -> welcome
+                              -> queued/assigned -> becomes the gameplay socket
+  gameplay loop:
+    agent_view / turn_advanced -> decide() -> send action (or free action)
+    action_result (canAct=false after a cooldown action) -> wait for
+      can_act_changed before sending another cooldown-group action
+    agent_died with meta.youDied == true -> stop, this run is over
+    game_ended -> read result, go back to matchmaking
+
+Config is via environment variables — see .env.example / docker-compose.yml.
 """
 
 from __future__ import annotations
@@ -29,8 +50,11 @@ API_KEY = os.environ.get("CLAW_API_KEY", "").strip()
 BASE_HOST = os.environ.get("CLAW_HOST", "cdn.clawroyale.ai").strip()
 REST_BASE = f"https://{BASE_HOST}/api"
 WS_JOIN_URL = f"wss://{BASE_HOST}/ws/join"
+WS_AGENT_URL = f"wss://{BASE_HOST}/ws/agent"
 
 ENTRY_TYPE_PREFERENCE = os.environ.get("CLAW_ENTRY_TYPE", "auto").strip().lower()
+# "auto" -> paid if ready else free ; "free" ; "paid"
+
 LOG_LEVEL = os.environ.get("CLAW_LOG_LEVEL", "INFO").upper()
 STATE_POLL_INTERVAL = float(os.environ.get("CLAW_STATE_POLL_INTERVAL", "5"))
 RECONNECT_MIN_DELAY = float(os.environ.get("CLAW_RECONNECT_MIN_DELAY", "1"))
@@ -46,6 +70,13 @@ log = logging.getLogger("clawroyale")
 
 
 def log_info_block(title: str, fields: dict) -> None:
+    """Print a readable multi-line block like:
+        === Account ===
+        nama       : Otooong
+        balance    : 0 sMoltz
+        ...
+    Skips fields whose value is None so optional data doesn't clutter it.
+    """
     lines = [f"=== {title} ==="]
     label_width = max((len(k) for k in fields), default=0)
     for key, value in fields.items():
@@ -70,7 +101,7 @@ class ApiError(Exception):
 class RestClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.version = "1"
+        self.version = "1"  # refreshed by fetch_version()
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self) -> "RestClient":
@@ -92,6 +123,8 @@ class RestClient:
         assert self._session
         async with self._session.get(f"{REST_BASE}/version") as resp:
             data = await resp.json()
+            # Server payload shape is loosely typed in the spec
+            # (additionalProperties: true) — try common keys.
             v = str(data.get("version") or data.get("data", {}).get("version") or "1")
             self.version = v
             return v
@@ -104,6 +137,7 @@ class RestClient:
                 method, url, headers=self._headers(), **kwargs
             ) as resp:
                 if resp.status == 426:
+                    # VERSION_MISMATCH — refresh and retry once
                     log.warning("426 VERSION_MISMATCH on %s — refreshing X-Version", path)
                     await self.fetch_version()
                     continue
@@ -124,6 +158,9 @@ class RestClient:
 
     async def get_me(self) -> dict:
         data = await self.request("GET", "/accounts/me")
+        # Some deployments wrap this in {"success": true, "data": {...}},
+        # others return MeResponse fields at the top level directly.
+        # Handle both without guessing wrong every time.
         if "data" in data and isinstance(data.get("data"), dict) and "name" not in data:
             return data["data"]
         return data
@@ -157,61 +194,297 @@ class RestClient:
         )
 
 
+# --------------------------------------------------------------------------
+# Loadout setup — best-effort: fill Main+Sub pack + 3 relic slots from
+# whatever the account already owns. This does NOT buy anything from the
+# shop; it only equips what is already in inventory. Run the shop / gacha
+# flow manually first if your inventory is empty (see references/shop.md).
+# --------------------------------------------------------------------------
+
 async def ensure_loadout(rest: RestClient) -> None:
     try:
         loadout = (await rest.get_loadout()).get("data", {})
-    except ApiError:
+    except ApiError as e:
+        log.warning("could not read loadout: %s", e)
         return
 
+    log.info(
+        "current loadout: fullSet=%s activePack=%s subPack=%s slots=%s",
+        loadout.get("fullSet"),
+        loadout.get("activePack"),
+        loadout.get("subPack"),
+        loadout.get("slots"),
+    )
+
     if loadout.get("fullSet"):
+        log.info("loadout already fullSet — skipping setup")
         return
+
+    log.info("loadout incomplete — attempting to auto-fill from inventory")
 
     try:
         packs = await rest.get_inventory_packs()
         relics = await rest.get_inventory_relics()
-    except ApiError:
+    except ApiError as e:
+        log.warning("could not read inventory: %s", e)
         return
 
     active_pack = loadout.get("activePack")
     slots = loadout.get("slots") or [None, None, None]
 
+    # Fill main pack if missing
     if not active_pack and packs:
         main_candidate = packs[0]
         try:
             await rest.set_active_pack(main_candidate["instanceId"])
-        except ApiError:
-            pass
+            log.info("equipped main pack instanceId=%s", main_candidate["instanceId"])
+        except ApiError as e:
+            log.warning("failed to equip main pack: %s", e)
 
+    # Fill sub pack if there's a second distinct pack available
+    # (server rejects Main-only packs in the sub slot; we just try and log).
     if len(packs) > 1:
         try:
             await rest.set_sub_pack(packs[1]["instanceId"])
-        except ApiError:
-            pass
+            log.info("equipped sub pack instanceId=%s", packs[1]["instanceId"])
+        except ApiError as e:
+            log.info("sub pack equip skipped/failed: %s", e)
 
+    # Fill relic slots by typeIndex (0..2) from owned relics matching each slot
     for type_index in range(3):
         if slots[type_index]:
             continue
-        candidate = next((r for r in relics if r.get("typeIndex") == type_index), None)
+        candidate = next(
+            (r for r in relics if r.get("typeIndex") == type_index), None
+        )
         if candidate:
             try:
                 await rest.equip_relic(type_index, candidate["instanceId"])
-            except ApiError:
-                pass
+                log.info(
+                    "equipped relic slot=%s instanceId=%s",
+                    type_index,
+                    candidate["instanceId"],
+                )
+            except ApiError as e:
+                log.warning("failed to equip relic slot %s: %s", type_index, e)
+
+    if not packs or len(relics) < 3:
+        log.warning(
+            "inventory insufficient for a full loadout (packs=%d relics=%d) — "
+            "entering with partial/base stats. Buy packs/relics via the shop "
+            "to improve this.",
+            len(packs), len(relics),
+        )
 
 
 # --------------------------------------------------------------------------
-# Data Structures & BFS Pathfinding
+# Decision logic
 # --------------------------------------------------------------------------
+#
+# Ranking (1.15.0+): alive first -> survival time DESC -> kills DESC ->
+# EP used ASC -> agent id ASC. Remaining HP does not matter by itself.
+# So the guiding principle is: SURVIVE FIRST, fight only when it does not
+# cost you survival time, never trade survival time for a kill.
+#
+# Exact WS action payload field names are not pinned down in the material
+# available to this bot, so `decide()` returns an abstract Decision and
+# `send_action()` renders it defensively (tries the most standard shape;
+# logs the raw server response either way so you can see exactly what the
+# server accepted/rejected and tighten this mapping over time).
 
 @dataclass
 class Decision:
-    kind: str  # "move" | "attack" | "explore" | "equip" | "wait"
+    kind: str  # "move" | "attack" | "explore" | "equip" | "wait" | "flee"
     target_region_id: Optional[str] = None
     target_agent_id: Optional[str] = None
     target_monster_id: Optional[str] = None
     ruin_id: Optional[str] = None
     item_id: Optional[str] = None
     reason: str = ""
+
+
+def is_cooldown_action(kind: str) -> bool:
+    # move / attack / explore consume the turn and enter a cooldown group;
+    # pickup / equip / talk / whisper / broadcast are free per the docs —
+    # so using a heal item does NOT block the next real action this turn.
+    return kind in {"move", "attack", "explore"}
+
+
+def decide(view: dict) -> Decision:
+    """Pure function: game view -> next action. Keep this readable and
+    tune it here — this is the whole 'strategy' of the bot."""
+
+    self_state = view.get("self", {}) or {}
+    hp = self_state.get("hp", 100)
+    max_hp_guess = self_state.get("maxHp", 100) or 100
+    ep = self_state.get("ep", 0)
+    in_cave = self_state.get("inCave", False)
+    current_region = view.get("currentRegion", {}) or {}
+    is_death_zone = current_region.get("isDeathZone", False)
+    connections = current_region.get("connections") or []
+    visible_agents = view.get("visibleAgents") or []
+    visible_monsters = view.get("visibleMonsters") or []
+    visible_ruins = view.get("visibleRuins") or []
+    pending_deathzones = view.get("pendingDeathzones") or []
+
+    hp_ratio = hp / max_hp_guess if max_hp_guess else 1.0
+
+    # 1) Currently standing in a death zone (or one is about to activate
+    #    here) -> leave immediately, this outranks everything else.
+    pending_here_ids = {dz.get("id") for dz in pending_deathzones}
+    if is_death_zone or current_region.get("id") in pending_here_ids:
+        safe_targets = [c for c in connections]
+        if safe_targets:
+            return Decision(
+                kind="move",
+                target_region_id=random.choice(safe_targets),
+                reason="evacuating death zone",
+            )
+
+    # 1.5) Crowded/contested region -> too many visible agents means high
+    #    risk of being attacked from multiple directions at once, even if
+    #    our own HP looks fine right now. Observed pattern: large
+    #    unexplained HP drops (e.g. 87 -> 58 in one turn) happening in
+    #    regions with 15-19+ visible agents, with no death zone / alert
+    #    gauge / weather flag explaining it — most likely damage from
+    #    agents the fight-or-flee logic below doesn't account for when
+    #    the crowd is this dense. Evacuate before engaging with anything.
+    CROWDED_THRESHOLD = 10
+    if len(visible_agents) > CROWDED_THRESHOLD and connections:
+        return Decision(
+            kind="move",
+            target_region_id=random.choice(connections),
+            reason=(
+                f"crowded region ({len(visible_agents)} agents visible) — "
+                "evacuating before engaging, high risk of multi-attacker damage"
+            ),
+        )
+
+    # 2) Low HP -> disengage and retreat rather than fight, since survival
+    #    time outranks kills in the current ranking rules. This must fire
+    #    regardless of WHY hp is low (agent damage, monster counter-hit,
+    #    zone/weather tick) — critical HP always means "get out", not just
+    #    when a hostile agent happens to be visible.
+    if hp_ratio < 0.40:
+        if connections:
+            return Decision(
+                kind="move",
+                target_region_id=random.choice(connections),
+                reason=f"critical HP ({hp_ratio:.0%}) — retreating unconditionally",
+            )
+        else:
+            return Decision(
+                kind="wait",
+                reason=f"critical HP ({hp_ratio:.0%}) but no connections to flee to",
+            )
+
+    # 2.5) Auto-heal: use a recovery item from inventory when HP is
+    #    moderately low. This is a FREE action (doesn't consume the turn
+    #    per skill.md's free-action list), so returning this here doesn't
+    #    block move/attack — maybe_act sends this first, then the normal
+    #    decide() output still gets acted on afterward this same turn.
+    inventory_items = self_state.get("inventory") or []
+    recovery_items = [i for i in inventory_items if i.get("category") == "recovery"]
+    if hp_ratio < 0.75 and recovery_items:
+        best_item = max(recovery_items, key=lambda i: i.get("hpRestore", 0))
+        if best_item.get("hpRestore", 0) > 0:
+            return Decision(
+                kind="equip",
+                item_id=best_item.get("id"),
+                reason=(
+                    f"auto-heal: using {best_item.get('name', 'recovery item')} "
+                    f"(hp={hp_ratio:.0%}, restores {best_item.get('hpRestore')})"
+                ),
+            )
+
+    # 3) Healthy and a weak, isolated target is adjacent -> only then
+    #    consider a fight. Never chase; only engage what's already here.
+    if hp_ratio >= 0.6 and visible_agents:
+        non_guardian_targets = [a for a in visible_agents if not a.get("isGuardian")]
+        if non_guardian_targets:
+            weakest = min(
+                non_guardian_targets,
+                key=lambda a: a.get("hp", 999),
+            )
+            if weakest.get("hp", 999) <= hp * 0.7 and ep > 0:
+                return Decision(
+                    kind="attack",
+                    target_agent_id=weakest.get("id"),
+                    reason="engaging weaker isolated target while healthy",
+                )
+
+    # 4) A monster is visible and we're healthy with EP -> fine to fight
+    #    (monsters are usually a safer EP/reward trade than agents).
+    if hp_ratio >= 0.5 and visible_monsters and ep > 0:
+        weakest_monster = min(visible_monsters, key=lambda m: m.get("hp", 999))
+        return Decision(
+            kind="attack",
+            target_monster_id=weakest_monster.get("id"),
+            reason="clearing a weak monster for loot/reward",
+        )
+
+    # 5) In a cave -> the only way out is to interact the same
+    #    interactableId used to enter; this bot does not track that id
+    #    across turns (kept out of scope), so default to waiting it out
+    #    unless a specific integration adds tracking.
+    if in_cave:
+        return Decision(kind="wait", reason="in cave — awaiting explicit exit handling")
+
+    # 6) A ruin is nearby and alert risk is low -> explore it for
+    #    relics/packs. Each explore raises alertGauge +2 (+4 more on full
+    #    clear); at gauge 10 guardians actively hunt you. Back off well
+    #    before alertActive actually triggers, and require more HP margin
+    #    than other actions since a ruin ambush can hit hard.
+    alert_active = self_state.get("alertActive", False)
+    alert_gauge = self_state.get("alertGauge", 0) or 0
+    if visible_ruins and not alert_active and alert_gauge <= 4 and hp_ratio >= 0.7:
+        ruin = next((r for r in visible_ruins if not r.get("isEmpty")), None)
+        if ruin:
+            return Decision(
+                kind="explore",
+                ruin_id=ruin.get("ruinId"),
+                reason=f"exploring ruin (alertGauge={alert_gauge}, hp={hp_ratio:.0%})",
+            )
+
+    # 7) Nothing urgent -> reposition toward an unexplored-looking
+    #    connection to keep finding ruins/loot rather than idling in place
+    #    (idling in one region for too long is a common way to get
+    #    cornered as the map shrinks).
+    if connections:
+        return Decision(
+            kind="move",
+            target_region_id=random.choice(connections),
+            reason="no immediate threat/opportunity — repositioning",
+        )
+
+    return Decision(kind="wait", reason="no connections and nothing to do")
+
+
+def build_action_payload(decision: Decision) -> dict:
+    """Best-effort mapping from Decision -> the WS action message.
+    Confirm/adjust field names against real `action_result` responses —
+    the bot logs the full raw frame for exactly this purpose."""
+
+    payload: dict[str, Any] = {"type": "action", "action": decision.kind}
+
+    if decision.kind == "move" and decision.target_region_id:
+        payload["targetRegionId"] = decision.target_region_id
+    elif decision.kind == "attack":
+        if decision.target_agent_id:
+            payload["targetAgentId"] = decision.target_agent_id
+        elif decision.target_monster_id:
+            payload["targetMonsterId"] = decision.target_monster_id
+    elif decision.kind == "explore" and decision.ruin_id:
+        payload["ruinId"] = decision.ruin_id
+    elif decision.kind == "equip" and decision.item_id:
+        payload["itemId"] = decision.item_id
+
+    return payload
+
+
+# --------------------------------------------------------------------------
+# Gameplay WebSocket loop
+# --------------------------------------------------------------------------
 
 @dataclass
 class GameSession:
@@ -222,226 +495,14 @@ class GameSession:
     last_view: dict = field(default_factory=dict)
     last_view_turn: Optional[int] = None
     last_decision_kind: Optional[str] = None
-    last_action_target: Optional[str] = None  
+    last_action_target: Optional[str] = None  # ruinId, targetAgentId, or targetMonsterId
     consecutive_same_target: int = 0
     confirmed_dead_targets: set = field(default_factory=set)
-    last_seen_target_hp: dict = field(default_factory=dict)  
+    last_seen_target_hp: dict = field(default_factory=dict)  # targetId -> hp
     last_equipment_signature: Optional[str] = None
-    
-    # Advanced Memory (Graph Mapping)
-    graph: dict = field(default_factory=dict)
-    unexplored_regions: set = field(default_factory=set)
-    visited_regions: list = field(default_factory=list)
+    dangerous_regions: set = field(default_factory=set)  # regionId -> seen a big HP drop here
+    recently_healed_items: set = field(default_factory=set)  # itemId -> already auto-healed with this
 
-
-def bfs_find_path(start: str, targets: set, graph: dict) -> Optional[str]:
-    """Mencari rute terdekat menuju area yang belum terjamah."""
-    if not targets or start not in graph:
-        return None
-    
-    queue = [(start, [])]
-    visited = {start}
-    
-    while queue:
-        curr, path = queue.pop(0)
-        if curr in targets and path:
-            return path[0]  # Kembalikan langkah pertama
-        
-        for neighbor in graph.get(curr, []):
-            if neighbor not in visited:
-                visited.add(neighbor)
-                queue.append((neighbor, path + [neighbor]))
-    return None
-
-def smart_move(connections: list, session: GameSession, current_region: str) -> str:
-    """Menggunakan BFS untuk ke ruang baru, atau fallback ke smart-random."""
-    best_step = bfs_find_path(current_region, session.unexplored_regions, session.graph)
-    if best_step and best_step in connections:
-        return best_step
-    
-    unvisited = [c for c in connections if c not in session.visited_regions]
-    if unvisited:
-        return random.choice(unvisited)
-    return random.choice(connections)
-
-def is_cooldown_action(kind: str) -> bool:
-    return kind in {"move", "attack", "explore"}
-
-
-# --------------------------------------------------------------------------
-# Decision logic (ULTIMATE SKYNET EDITION)
-# --------------------------------------------------------------------------
-
-def decide(view: dict, session: GameSession) -> Decision:
-    self_state = view.get("self", {}) or {}
-    hp = self_state.get("hp", 100)
-    max_hp_guess = self_state.get("maxHp", 100) or 100
-    ep = self_state.get("ep", 0)
-    in_cave = self_state.get("inCave", False)
-    
-    current_region = view.get("currentRegion", {}) or {}
-    curr_region_id = current_region.get("id")
-    is_death_zone = current_region.get("isDeathZone", False)
-    connections = current_region.get("connections") or []
-    pending_deathzones = view.get("pendingDeathzones") or []
-    
-    visible_agents = view.get("visibleAgents") or []
-    visible_monsters = view.get("visibleMonsters") or []
-    visible_ruins = view.get("visibleRuins") or []
-    inventory = self_state.get("inventory") or []
-
-    hp_ratio = hp / max_hp_guess if max_hp_guess else 1.0
-    has_weapon = self_state.get("equippedWeapon") is not None
-
-    # Kalkulasi HP Drop (SL Plus Algorithm)
-    prev_hp = (session.last_view.get("self") or {}).get("hp") if session.last_view else hp
-    hp_drop = prev_hp - hp if prev_hp is not None else 0
-
-    # 1) PRIORITAS MUTLAK 1: KABUR DARI DEATH ZONE (PANIC MODE)
-    pending_here_ids = {dz.get("id") for dz in pending_deathzones}
-    if is_death_zone or curr_region_id in pending_here_ids:
-        if connections:
-            return Decision(
-                kind="move",
-                target_region_id=random.choice(connections), # Ganti jadi random.choice biar gak maksain rute nyangkut
-                reason="[URGENT] Evakuasi dari Death Zone mutlak! (Pintu acak)",
-            )
-
-    # 2) PRIORITAS MUTLAK 2: EMERGENCY EJECT (SL PLUS) (PANIC MODE)
-    if hp_drop >= 25:
-        if connections:
-            return Decision(
-                kind="move",
-                target_region_id=random.choice(connections), # Ganti jadi random.choice
-                reason=f"[SL PLUS] Damage spike terdeteksi! Hilang {hp_drop} HP, lari acak!",
-            )
-
-    # 3) DYNAMIC RISK SCORING
-    risk_score = 0
-    guardian_present = False
-    for a in visible_agents:
-        if a.get("isGuardian"):
-            risk_score += 50
-            guardian_present = True
-        elif a.get("hp", 100) < 30:
-            risk_score -= 10  # Prasmanan kill, turunkan risiko
-        else:
-            risk_score += 15
-            
-    alert_gauge = self_state.get("alertGauge", 0) or 0
-    risk_score += (alert_gauge * 5)
-    
-    # 4) AUTO-HEAL
-    recovery_items = [i for i in inventory if i.get("category") == "recovery"]
-    if hp_ratio <= 0.60 and recovery_items:
-        item_to_use = recovery_items[0]
-        if item_to_use.get("id") != session.last_action_target or session.consecutive_same_target < 2:
-            return Decision(
-                kind="equip", 
-                item_id=item_to_use.get("id"),
-                reason=f"[AUTO-HEAL] Konsumsi {item_to_use.get('name')} (Sisa HP: {hp_ratio:.0%})"
-            )
-
-    # ==========================================
-    # HYBRID LOGIC & SMART TARGET SELECTION
-    # ==========================================
-    
-    # Evaluasi Resiko Ekstrim
-    # Jika tangan kosong, toleransi risk = 15. Jika bawa senjata, toleransi risk = 40.
-    max_risk_tolerance = 40 if has_weapon else 15
-    if risk_score > max_risk_tolerance and hp_ratio < 0.90:
-        if connections:
-            return Decision(
-                kind="move",
-                target_region_id=smart_move(connections, session, curr_region_id),
-                reason=f"[RISK SCORING] Bahaya ekstrim (Skor: {risk_score}), mundur cari posisi!"
-            )
-
-    # Memilah Target (Smart Target Selection)
-    non_guardian_targets = [a for a in visible_agents if not a.get("isGuardian")]
-    if non_guardian_targets and ep > 0:
-        weakest = min(non_guardian_targets, key=lambda a: a.get("hp", 999))
-        weakest_hp = weakest.get("hp", 999)
-        
-        # SMART WAIT: Biarkan Guardian yang eksekusi
-        if guardian_present and weakest_hp < 40:
-            return Decision(
-                kind="wait",
-                reason=f"[SMART TARGET] Menunggu Guardian membunuh target lemah ({weakest_hp} HP)"
-            )
-
-        # Serang jika syarat terpenuhi
-        if has_weapon and hp_ratio >= 0.30:
-            return Decision(
-                kind="attack",
-                target_agent_id=weakest.get("id"),
-                reason=f"[MODE BARBAR] Eksekusi agen! (Target HP: {weakest_hp})",
-            )
-        elif not has_weapon and weakest_hp <= hp * 0.3:
-            return Decision(
-                kind="attack",
-                target_agent_id=weakest.get("id"),
-                reason=f"[MODE PEMULUNG] Nyampah agen sekarat (Target HP: {weakest_hp})",
-            )
-
-    # Serang Monster (Priority Low)
-    if visible_monsters and ep > 0:
-        weakest_monster = min(visible_monsters, key=lambda m: m.get("hp", 999))
-        mon_hp = weakest_monster.get("hp", 999)
-        if has_weapon and hp_ratio >= 0.5:
-            return Decision(
-                kind="attack",
-                target_monster_id=weakest_monster.get("id"),
-                reason=f"[MODE BARBAR] Farming monster (HP: {mon_hp})",
-            )
-        elif not has_weapon and mon_hp < 25:
-            return Decision(
-                kind="attack",
-                target_monster_id=weakest_monster.get("id"),
-                reason=f"[MODE PEMULUNG] Gebuk monster lemah (HP: {mon_hp})",
-            )
-
-    # Eksplorasi Ruin (Nge-loot)
-    alert_active = self_state.get("alertActive", False)
-    if visible_ruins and not alert_active and alert_gauge <= 4:
-        ruin = next((r for r in visible_ruins if not r.get("isEmpty")), None)
-        if ruin:
-            return Decision(
-                kind="explore",
-                ruin_id=ruin.get("ruinId"),
-                reason=f"Membongkar ruin (alert={alert_gauge}, hp={hp_ratio:.0%})",
-            )
-
-    if in_cave:
-        return Decision(kind="wait", reason="Di dalam gua — menunggu interaksi")
-
-    if connections:
-        return Decision(
-            kind="move",
-            target_region_id=smart_move(connections, session, curr_region_id),
-            reason="Repositioning — BFS Pathfinding ke area baru",
-        )
-
-    return Decision(kind="wait", reason="Buntu, tidak ada yang bisa dilakukan")
-
-
-def build_action_payload(decision: Decision) -> dict:
-    payload: dict[str, Any] = {"type": "action", "action": decision.kind}
-    if decision.kind == "move" and decision.target_region_id:
-        payload["targetRegionId"] = decision.target_region_id
-    elif decision.kind == "attack":
-        if decision.target_agent_id: payload["targetAgentId"] = decision.target_agent_id
-        elif decision.target_monster_id: payload["targetMonsterId"] = decision.target_monster_id
-    elif decision.kind == "explore" and decision.ruin_id:
-        payload["ruinId"] = decision.ruin_id
-    elif decision.kind == "equip" and decision.item_id:
-        payload["itemId"] = decision.item_id
-    return payload
-
-
-# --------------------------------------------------------------------------
-# Gameplay WebSocket loop
-# --------------------------------------------------------------------------
 
 async def send_hello(ws, entry_type: str) -> None:
     hello = {"type": "hello", "entryType": entry_type}
@@ -450,22 +511,28 @@ async def send_hello(ws, entry_type: str) -> None:
 
 
 async def play_session(ws, session: GameSession) -> str:
+    """Consume frames until the agent dies or the game ends.
+    Returns 'died' | 'ended' | 'closed' to tell the caller what happened."""
+
     async for raw in ws:
         try:
             frame = json.loads(raw)
         except json.JSONDecodeError:
+            log.warning("non-JSON frame: %r", raw[:200])
             continue
 
         ftype = frame.get("type")
+        log.debug("frame: %s", json.dumps(frame)[:500])
 
         if ftype == "welcome":
             decision = frame.get("decision")
+            log.info("welcome decision=%s", decision)
             if decision == "BLOCKED":
-                log.error("join blocked by server")
+                log.error("join blocked by server: %s", frame)
                 return "closed"
 
         elif ftype in ("waiting", "queued"):
-            pass # Keep it clean
+            log.info("%s: %s", ftype, json.dumps(frame)[:300])
 
         elif ftype == "assigned":
             session.game_id = frame.get("gameId")
@@ -482,43 +549,33 @@ async def play_session(ws, session: GameSession) -> str:
             new_max_hp = new_self.get("maxHp")
             session.last_view = view
             session.last_view_turn = frame.get("turn")
-            
-            # --- GRAPH UPDATE (MEMORY) ---
+            reason = frame.get("reason")
+
             current_region = view.get("currentRegion", {}) or {}
-            curr_reg_id = current_region.get("id")
-            connections = current_region.get("connections", [])
-            
-            if curr_reg_id:
-                session.graph[curr_reg_id] = connections
-                for c in connections:
-                    if c not in session.graph:
-                        session.unexplored_regions.add(c)
-                if curr_reg_id in session.unexplored_regions:
-                    session.unexplored_regions.remove(curr_reg_id)
-
-                if not session.visited_regions or session.visited_regions[-1] != curr_reg_id:
-                    session.visited_regions.append(curr_reg_id)
-                    if len(session.visited_regions) > 5:
-                        session.visited_regions.pop(0) 
-
             visible_agents = view.get("visibleAgents") or []
             visible_monsters = view.get("visibleMonsters") or []
             visible_ruins = view.get("visibleRuins") or []
-            hp_display = f"{new_hp}/{new_max_hp}" if new_max_hp else str(new_hp)
+
+            hp_display = (
+                f"{new_hp}/{new_max_hp}" if new_max_hp else str(new_hp)
+            )
 
             log_info_block("Status", {
                 "turn": session.last_view_turn,
                 "hp": hp_display,
                 "ep": new_self.get("ep"),
                 "bisa aksi": session.can_act,
-                "posisi (region)": curr_reg_id,
+                "posisi (region)": current_region.get("id"),
                 "death zone": current_region.get("isDeathZone"),
                 "musuh terlihat": len(visible_agents) or None,
                 "monster terlihat": len(visible_monsters) or None,
                 "ruin terlihat": len(visible_ruins) or None,
                 "alert gauge": new_self.get("alertGauge"),
+                "update type": f"{ftype} ({reason})" if reason else ftype,
             })
 
+            # Equipment snapshot — weapon + inventory items, logged only when
+            # it actually changes so this doesn't spam every single turn.
             equipped_weapon = new_self.get("equippedWeapon")
             inventory_items = new_self.get("inventory") or []
             equip_signature = json.dumps(
@@ -535,17 +592,54 @@ async def play_session(ws, session: GameSession) -> str:
                     equipped_weapon.get("name") if isinstance(equipped_weapon, dict)
                     else equipped_weapon
                 )
-                log_info_block("Equipment / Inventory", {
+                log_info_block("Equipment", {
                     "weapon": weapon_name or "(kosong)",
                     **(item_lines or {"item": "(kosong)"}),
                 })
-            
+                # An item id no longer present means the server confirmed
+                # it was consumed (or it's simply gone) — clear it from the
+                # "already healed with this" set so a future item sharing
+                # that id (e.g. a re-stacked pickup) isn't wrongly skipped.
+                current_item_ids = {it.get("id") for it in inventory_items}
+                session.recently_healed_items &= current_item_ids
+            # Diagnostic: if HP dropped since the last view and it wasn't
+            # from an attack we just sent, dump the ENTIRE raw view so any
+            # field we haven't modeled (weather, events, guardian proximity,
+            # status effects — whatever the server actually uses) becomes
+            # visible instead of guessed at. Fires on any large-ish drop
+            # regardless of last action, since large drops have now been
+            # observed both on non-attack turns AND right after our own
+            # attack action (e.g. 57->21 following an attack) — excluding
+            # attack turns was hiding half the relevant data.
+            HP_DROP_DIAGNOSTIC_THRESHOLD = 10
+            if (
+                prev_hp is not None
+                and new_hp is not None
+                and (prev_hp - new_hp) >= HP_DROP_DIAGNOSTIC_THRESHOLD
+            ):
+                danger_region_id = (view.get("currentRegion") or {}).get("id")
+                if danger_region_id:
+                    session.dangerous_regions.add(danger_region_id)
+                log.warning(
+                    "HP dropped %s -> %s (delta=%s) last_action=%s region=%s "
+                    "(marked as dangerous, will avoid revisiting) "
+                    "— FULL raw view=%s",
+                    prev_hp, new_hp, prev_hp - new_hp, session.last_decision_kind,
+                    danger_region_id, json.dumps(view, default=str),
+                )
             await maybe_act(ws, session, view)
 
         elif ftype == "action_rejected":
+            # Same frame shape as agent_view/turn_advanced but tagged as a
+            # failed-action snapshot (1.15.0). Treat identically — it is
+            # the authoritative state at this moment, action was refused.
             view = frame.get("view", {})
             session.last_view = view
             session.last_view_turn = frame.get("turn")
+            log.info(
+                "action_rejected — refreshed state turn=%s hp=%s",
+                session.last_view_turn, (view.get("self") or {}).get("hp"),
+            )
             await maybe_act(ws, session, view)
 
         elif ftype == "action_result":
@@ -553,19 +647,25 @@ async def play_session(ws, session: GameSession) -> str:
             can_act = frame.get("canAct")
             if can_act is not None:
                 session.can_act = can_act
-            
+            cooldown_ms = frame.get("cooldownRemainingMs")
             error = frame.get("error") or {}
-            
-            if session.last_decision_kind == "explore" and success:
-                log.info("💎 [SUKSES EKSPLORASI] Berhasil membongkar ruin! Cek log game untuk item.")
-            elif session.last_decision_kind == "equip" and success:
-                log.info("🟢 [SUKSES HEALING] Item berhasil digunakan!")
-            elif not success:
-                log.warning(f"❌ [AKSI GAGAL] Sistem menolak aksi: {error.get('code')} - {error.get('message')}")
-            
+            log.info(
+                "action_result success=%s canAct=%s cooldownRemainingMs=%s error=%s",
+                success, can_act, cooldown_ms, error,
+            )
+            # TARGET_DEAD (1.15.0) is the authoritative "that target is
+            # already dead" signal — distinct from AGENT_DEAD (our own
+            # death). Remember it so the repeat-attack guard can retarget
+            # instead of blindly refusing every repeat.
             if error.get("code") == "TARGET_DEAD" and session.last_action_target:
                 session.confirmed_dead_targets.add(session.last_action_target)
-            
+                log.info(
+                    "target=%s confirmed dead via TARGET_DEAD",
+                    session.last_action_target,
+                )
+            # Some server versions attach a fresh view directly on the
+            # action_result frame itself — capture it if present so the
+            # next decision isn't made from a stale cached view.
             inline_view = frame.get("view")
             if inline_view:
                 session.last_view = inline_view
@@ -573,106 +673,269 @@ async def play_session(ws, session: GameSession) -> str:
 
         elif ftype == "can_act_changed":
             session.can_act = frame.get("canAct", True)
+            log.info("can_act_changed -> %s", session.can_act)
             if session.can_act and session.last_view:
                 await maybe_act(ws, session, session.last_view)
-
-        elif ftype == "log":
-            msg = frame.get("message")
-            if msg:
-                log.info(f"📢 LOG GAME: {msg}")
 
         elif ftype == "agent_died":
             meta = frame.get("meta", {}) or {}
             if meta.get("youDied"):
-                log_info_block("💀 AGEN TEWAS", {
-                    "waktu bertahan": frame.get("survivalTime"),
-                    "total kill": frame.get("kills")
-                })
+                log.info(
+                    "we died — survivalTime=%s kills=%s",
+                    frame.get("survivalTime"), frame.get("kills"),
+                )
                 session.alive = False
                 return "died"
+            else:
+                log.debug("another agent died (not us)")
 
         elif ftype == "game_ended":
-            log.info("🏁 GAME SELESAI.")
+            log.info("game_ended: %s", json.dumps(frame)[:800])
             return "ended"
+
+        elif ftype == "log":
+            log.debug("game log: %s", frame.get("message"))
+
+        else:
+            log.debug("unhandled frame type=%s", ftype)
 
     return "closed"
 
 
-async def maybe_act(ws, session: GameSession, view: dict) -> None:
-    if not view: return
-    self_state = view.get("self", {}) or {}
-    if self_state.get("isAlive") is False: return
-    if not session.can_act: return
+def get_target_current_hp(view: dict, target_id: str) -> Optional[int]:
+    """Look up a target's current HP from visibleAgents/visibleMonsters by id,
+    so the attack-repeat guard can tell if a previous hit actually landed."""
+    for a in (view.get("visibleAgents") or []):
+        if a.get("id") == target_id:
+            return a.get("hp")
+    for m in (view.get("visibleMonsters") or []):
+        if m.get("id") == target_id:
+            return m.get("hp")
+    return None
 
-    decision = decide(view, session)
+
+async def maybe_act(ws, session: GameSession, view: dict) -> None:
+    if not view:
+        return
+
+    self_state = view.get("self", {}) or {}
+    if self_state.get("isAlive") is False:
+        return
+
+    hp = self_state.get("hp")
+
+    # Free actions (talk/whisper) go BEFORE the main action and never
+    # consume the turn — placeholder hook, extend with real chat logic
+    # if you want the agent to communicate.
+    # await send_free_action(ws, {"type": "action", "action": "whisper", ...})
+
+    if not session.can_act:
+        log.debug("canAct is false — waiting for can_act_changed before acting")
+        return
+
+    # Steer away from regions we've already seen cause big HP drops. We
+    # build a filtered copy of the view rather than changing decide()'s
+    # signature, so decide() stays a simple, testable pure function.
+    working_view = view
+    if session.dangerous_regions:
+        region = view.get("currentRegion") or {}
+        connections = region.get("connections") or []
+        safe_connections = [c for c in connections if c not in session.dangerous_regions]
+        if safe_connections and len(safe_connections) < len(connections):
+            log.info(
+                "avoiding %d known-dangerous connection(s) out of %d options",
+                len(connections) - len(safe_connections), len(connections),
+            )
+            working_view = dict(view)
+            working_view["currentRegion"] = {**region, "connections": safe_connections}
+
+    decision = decide(working_view)
+
+    if decision.kind == "equip" and decision.item_id:
+        # Guard against re-sending the same heal every turn if HP is still
+        # below the auto-heal threshold right after using it (e.g. item's
+        # hpRestore was small, or the state update hasn't caught up yet):
+        # only heal once per (item_id) until something else changes.
+        already_used_this_item = (
+            decision.item_id in session.recently_healed_items
+        )
+        if not already_used_this_item:
+            session.recently_healed_items.add(decision.item_id)
+            log_info_block("Aksi (heal - free action)", {
+                "action": "equip",
+                "item": decision.item_id,
+                "alasan": decision.reason,
+            })
+            heal_payload = build_action_payload(decision)
+            await ws.send(json.dumps(heal_payload))
+            # equip is free — does not consume the turn, so fall through
+            # and still decide + send a real move/attack/explore below.
+        else:
+            log.debug(
+                "skipping repeat auto-heal on item=%s (already used this "
+                "session without a state refresh) — falling through to "
+                "normal decision",
+                decision.item_id,
+            )
+        # Re-derive the next decision from the working_view as normal —
+        # deliberately NOT re-reading fresh HP here since the server
+        # hasn't confirmed the heal yet; the next agent_view/turn_advanced
+        # frame will carry the real post-heal HP. For this turn we just
+        # move on to whatever the non-heal branches of decide() would do.
+        working_view_post_heal = dict(working_view)
+        working_view_post_heal["self"] = {
+            **self_state,
+            "inventory": [
+                i for i in (self_state.get("inventory") or [])
+                if i.get("id") != decision.item_id
+            ],
+        }
+        decision = decide(working_view_post_heal)
+
     current_target = (
-        decision.ruin_id or decision.target_monster_id or decision.target_agent_id or decision.item_id
+        decision.ruin_id or decision.target_monster_id or decision.target_agent_id
     )
 
-    if decision.kind in ["attack", "equip", "explore"] and current_target:
-        if current_target == session.last_action_target and session.last_decision_kind == decision.kind:
-            session.consecutive_same_target += 1
-        else:
-            session.consecutive_same_target = 0
+    if decision.kind == "attack" and current_target:
+        # Redirect only when we have a real reason to believe repeating is
+        # pointless: the target was already confirmed dead (TARGET_DEAD),
+        # its HP hasn't moved since our last hit (miss/blocked — no damage
+        # landed), or its HP went UP (regenerating/healing faster than we
+        # can damage it). Otherwise, an alive target that's taking damage
+        # is exactly what we WANT to keep hitting to close out the kill.
+        target_confirmed_dead = current_target in session.confirmed_dead_targets
+        current_target_hp = get_target_current_hp(view, current_target)
+        previously_seen_hp = session.last_seen_target_hp.get(current_target)
+        is_same_target_as_last_attack = (
+            current_target == session.last_action_target
+            and session.last_decision_kind == "attack"
+        )
+        no_damage_landed = (
+            is_same_target_as_last_attack
+            and previously_seen_hp is not None
+            and current_target_hp is not None
+            and current_target_hp == previously_seen_hp
+        )
+        target_healing = (
+            is_same_target_as_last_attack
+            and previously_seen_hp is not None
+            and current_target_hp is not None
+            and current_target_hp > previously_seen_hp
+        )
 
-        # Proteksi Anti-Stuck (Maks 2x coba)
-        if session.consecutive_same_target >= 2:
-            log_info_block("⚠️ AKSI DIBATALKAN (PROTEKSI STUCK)", {
-                "tindakan": "Mencegah spam ke target/ruin yang sama, nabrak pintu acak."
-            })
+        if target_confirmed_dead or no_damage_landed or target_healing:
+            log.warning(
+                "redirecting away from attack target=%s (confirmedDead=%s "
+                "noDamageLanded=%s targetHealing=%s prevHp=%s curHp=%s ep=%s) "
+                "— last attack payload sent was targeting this same id; if "
+                "this keeps happening, the attack action may not be landing "
+                "damage at all (payload field names may need adjusting)",
+                current_target, target_confirmed_dead, no_damage_landed,
+                target_healing, previously_seen_hp, current_target_hp,
+                self_state.get("ep"),
+            )
             connections = (view.get("currentRegion") or {}).get("connections") or []
             if connections:
                 decision = Decision(
                     kind="move",
-                    target_region_id=random.choice(connections), # Ganti jadi random biar pasti lepas
-                    reason="Membatalkan aksi macet, repo posisi acak",
+                    target_region_id=random.choice(connections),
+                    reason="redirecting off a dead/stuck/healing attack target",
                 )
                 current_target = None
             else:
-                decision = Decision(kind="wait", reason="Aksi macet tapi buntu")
+                decision = Decision(kind="wait", reason="dead/stuck/healing target, no exit")
                 current_target = None
+        else:
+            if current_target_hp is not None:
+                session.last_seen_target_hp[current_target] = current_target_hp
+            session.last_action_target = current_target
+
+    # Explore still uses a simple one-repeat block: ruins don't expose an
+    # HP-style signal to confirm progress, so we can't tell "still working
+    # on it" from "stuck" the way we can for attack. Repeating the exact
+    # same explore on the exact same ruin twice in a row is still refused.
+    elif decision.kind == "explore" and current_target:
+        if (
+            current_target == session.last_action_target
+            and session.last_decision_kind == "explore"
+        ):
+            session.consecutive_same_target += 1
+        else:
+            session.consecutive_same_target = 0
+
+        if session.consecutive_same_target >= 1:
+            log.warning(
+                "refusing to repeat explore on target=%s again without a fresh "
+                "turn (hp=%s) — falling back to repositioning instead",
+                current_target, hp,
+            )
+            connections = (view.get("currentRegion") or {}).get("connections") or []
+            if connections:
+                decision = Decision(
+                    kind="move",
+                    target_region_id=random.choice(connections),
+                    reason="breaking repeated-explore loop for safety",
+                )
+            else:
+                decision = Decision(kind="wait", reason="breaking repeat loop, no exit")
+            session.consecutive_same_target = 0
+            session.last_action_target = None
         else:
             session.last_action_target = current_target
     else:
+        # move/wait/other kinds don't carry a repeatable target — leave
+        # last_action_target as-is so a subsequent attack/explore decision
+        # can still be compared against the last REAL target we acted on.
         session.consecutive_same_target = 0
 
     session.last_decision_kind = decision.kind
+
     payload = build_action_payload(decision)
-    
     target_display = (
-        decision.target_region_id or decision.target_agent_id or 
-        decision.target_monster_id or decision.ruin_id or decision.item_id
+        decision.target_region_id
+        or decision.target_agent_id
+        or decision.target_monster_id
+        or decision.ruin_id
     )
-    
     log_info_block("Aksi", {
         "action": decision.kind,
         "target": target_display,
         "alasan": decision.reason,
+        "hp saat ini": hp,
     })
 
     await ws.send(json.dumps(payload))
 
     if is_cooldown_action(decision.kind):
+        # Optimistically mark canAct False until the server confirms via
+        # action_result / can_act_changed — avoids double-sending before
+        # the response arrives.
         session.can_act = False
 
 
 async def run_one_game(rest: RestClient, entry_type: str) -> str:
+    """Join (or resume) a single game and play it to completion.
+    Returns the outcome string from play_session, or 'error'."""
+
     headers = {
         "X-API-Key": rest.api_key,
         "X-Version": rest.version,
     }
+
     join_started_at = time.monotonic()
+
     try:
         async with websockets.connect(
             WS_JOIN_URL, additional_headers=headers, ping_interval=20, ping_timeout=20
         ) as ws:
             welcome_raw = await ws.recv()
             welcome = json.loads(welcome_raw)
-            
+            log.info("welcome frame: %s", json.dumps(welcome)[:400])
+
             if welcome.get("type") == "welcome":
                 decision = welcome.get("decision")
                 if decision == "BLOCKED":
-                    log.error("account not ready to join (%s)", entry_type)
+                    log.error("account not ready to join (%s) — see readiness in /accounts/me", entry_type)
                     return "blocked"
 
             await send_hello(ws, entry_type)
@@ -683,16 +946,28 @@ async def run_one_game(rest: RestClient, entry_type: str) -> str:
 
     except ConnectionClosed as e:
         waited = time.monotonic() - join_started_at
+        log.warning(
+            "websocket closed: code=%s reason=%s (after %.1fs since connect)",
+            e.code, e.reason, waited,
+        )
         if e.code == 1006 and waited < 120:
-            log.info("WebSocket closed 1006 (matchmaking timeout), retrying...")
-        elif e.code == 1013:
+            log.info(
+                "1006 while still in matchmaking queue — likely server-side "
+                "idle/matchmaking timeout, not a bot bug. Will retry."
+            )
+        if e.code == 1013:
+            log.info("RESUME_TARGET_DEAD — will re-dial for a fresh assignment")
             return "resume_dead"
-        elif e.code == 4032:
+        if e.code == 4032:
+            log.info("agent already dead in that game — dropping it")
             return "died"
         return "closed"
 
 
 async def choose_entry_type(rest: RestClient) -> Optional[str]:
+    """Consult /accounts/me readiness + currentGames to decide what to do
+    next, honoring the free/paid independent-slot rules from skill.md."""
+
     me = await rest.get_me()
     readiness = me.get("readiness", {}) or {}
     current_games = me.get("currentGames", []) or []
@@ -709,19 +984,27 @@ async def choose_entry_type(rest: RestClient) -> Optional[str]:
     paid_live = live("paid")
 
     if ENTRY_TYPE_PREFERENCE == "paid":
-        if paid_live or readiness.get("paidReady"): return "paid"
+        if paid_live or readiness.get("paidReady"):
+            return "paid"
+        log.info("paid requested but not ready/live — falling back to free")
         return "free"
-    if ENTRY_TYPE_PREFERENCE == "free": return "free"
-    
-    if paid_live: return "paid"
-    if free_live: return "free"
-    if readiness.get("paidReady"): return "paid"
+
+    if ENTRY_TYPE_PREFERENCE == "free":
+        return "free"
+
+    # auto: resume whichever is live; prefer paid for a fresh join if ready
+    if paid_live:
+        return "paid"
+    if free_live:
+        return "free"
+    if readiness.get("paidReady"):
+        return "paid"
     return "free"
 
 
 async def main_loop() -> None:
     if not API_KEY:
-        log.error("CLAW_API_KEY is not set")
+        log.error("CLAW_API_KEY is not set — see .env.example")
         sys.exit(1)
 
     stop = asyncio.Event()
@@ -735,10 +1018,12 @@ async def main_loop() -> None:
         try:
             loop.add_signal_handler(sig, _handle_signal)
         except NotImplementedError:
-            pass 
+            pass  # Windows dev fallback
 
     async with RestClient(API_KEY) as rest:
         await rest.fetch_version()
+        log.info("using X-Version=%s", rest.version)
+
         try:
             me = await rest.get_me()
             readiness = me.get("readiness", {}) or {}
@@ -746,12 +1031,14 @@ async def main_loop() -> None:
                 "nama": me.get("name"),
                 "balance": f"{me.get('balance')} sMoltz",
                 "wallet ok": readiness.get("walletAddress"),
+                "whitelist": readiness.get("whitelistApproved"),
                 "SC wallet": readiness.get("scWallet"),
+                "identity": readiness.get("identity"),
                 "sMoltz cukup": readiness.get("sMoltzSufficient"),
                 "paid ready": readiness.get("paidReady"),
             })
         except ApiError as e:
-            log.error("could not fetch account: %s", e)
+            log.error("could not fetch account — check CLAW_API_KEY: %s", e)
             sys.exit(1)
 
         reconnect_delay = RECONNECT_MIN_DELAY
@@ -760,11 +1047,14 @@ async def main_loop() -> None:
             try:
                 entry_type = await choose_entry_type(rest)
                 if entry_type is None:
+                    log.info("nothing to do right now — idling")
                     await asyncio.sleep(STATE_POLL_INTERVAL)
                     continue
 
                 await ensure_loadout(rest)
+
                 outcome = await run_one_game(rest, entry_type)
+                log.info("game outcome: %s", outcome)
 
                 if outcome in ("died", "ended", "resume_dead"):
                     reconnect_delay = RECONNECT_MIN_DELAY
@@ -775,7 +1065,16 @@ async def main_loop() -> None:
                     await asyncio.sleep(reconnect_delay)
                     reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
 
+            except ApiError as e:
+                log.error("API error in main loop: %s", e)
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
+            except (ConnectionClosed, OSError) as e:
+                log.warning("connection issue: %s — backing off %.1fs", e, reconnect_delay)
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
             except Exception:
+                log.exception("unexpected error in main loop")
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
 
