@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Claw Royale agent bot. (Ultimate Skynet Edition)
-Features: Hybrid Mode, Graph Mapping (BFS), Dynamic Risk, SL Plus Eject, Smart Target.
+Claw Royale agent bot. (Ultimate Skynet Edition - Panic Fixed)
+Features: Hybrid Mode, Graph Mapping (BFS), Dynamic Risk, SL Plus Eject, Smart Target, Panic Flee.
 """
 
 from __future__ import annotations
@@ -297,23 +297,23 @@ def decide(view: dict, session: GameSession) -> Decision:
     prev_hp = (session.last_view.get("self") or {}).get("hp") if session.last_view else hp
     hp_drop = prev_hp - hp if prev_hp is not None else 0
 
-    # 1) PRIORITAS MUTLAK 1: KABUR DARI DEATH ZONE
+    # 1) PRIORITAS MUTLAK 1: KABUR DARI DEATH ZONE (PANIC MODE)
     pending_here_ids = {dz.get("id") for dz in pending_deathzones}
     if is_death_zone or curr_region_id in pending_here_ids:
         if connections:
             return Decision(
                 kind="move",
-                target_region_id=smart_move(connections, session, curr_region_id),
-                reason="[URGENT] Evakuasi dari Death Zone mutlak!",
+                target_region_id=random.choice(connections), # Ganti jadi random.choice biar gak maksain rute nyangkut
+                reason="[URGENT] Evakuasi dari Death Zone mutlak! (Pintu acak)",
             )
 
-    # 2) PRIORITAS MUTLAK 2: EMERGENCY EJECT (SL PLUS)
+    # 2) PRIORITAS MUTLAK 2: EMERGENCY EJECT (SL PLUS) (PANIC MODE)
     if hp_drop >= 25:
         if connections:
             return Decision(
                 kind="move",
-                target_region_id=smart_move(connections, session, curr_region_id),
-                reason=f"[SL PLUS] Damage spike terdeteksi! Hilang {hp_drop} HP, Emergency Eject!",
+                target_region_id=random.choice(connections), # Ganti jadi random.choice
+                reason=f"[SL PLUS] Damage spike terdeteksi! Hilang {hp_drop} HP, lari acak!",
             )
 
     # 3) DYNAMIC RISK SCORING
@@ -618,14 +618,14 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
         # Proteksi Anti-Stuck (Maks 2x coba)
         if session.consecutive_same_target >= 2:
             log_info_block("⚠️ AKSI DIBATALKAN (PROTEKSI STUCK)", {
-                "tindakan": "Mencegah spam ke target/ruin yang sama, repo posisi."
+                "tindakan": "Mencegah spam ke target/ruin yang sama, nabrak pintu acak."
             })
             connections = (view.get("currentRegion") or {}).get("connections") or []
             if connections:
                 decision = Decision(
                     kind="move",
-                    target_region_id=smart_move(connections, session, view.get("currentRegion", {}).get("id")),
-                    reason="Membatalkan aksi macet, repo posisi via BFS",
+                    target_region_id=random.choice(connections), # Ganti jadi random biar pasti lepas
+                    reason="Membatalkan aksi macet, repo posisi acak",
                 )
                 current_target = None
             else:
