@@ -1,35 +1,7 @@
 #!/usr/bin/env python3
 """
 Claw Royale agent bot.
-(Aggressive Mode: Flash Looting, Smart Equip Armor & Weapon, Auto-Energy)
-
---------------------------------------------------------------------------
-Tuning notes (why this isn't pure "never retreat"):
-
-The game's ranking rule is: alive first -> survival time DESC -> kills
-DESC -> EP used ASC -> agent id ASC. Survival time outranks kills. That
-means a full "no retreat, ever" policy actively fights the ranking system
-- dying for one more kill is a net loss, not a win. This keeps the
-aggressive spirit (attack readily, don't flee ordinary fights, keep
-flash-looting/auto-equip) but adds two cheap guards that cost nothing
-when a game is going fine and only ever fire right before it would
-otherwise end badly:
-  - a critical-HP escape valve (only when there's no heal item left -
-    healing is still tried first, same as before)
-  - skipping *starting* a fight in an extremely crowded region (12+
-    visible agents) - this threshold is high on purpose so normal 1-3
-    agent skirmishes are completely untouched; it's grounded in an
-    earlier live incident where big unexplained HP drops correlated
-    specifically with 15-19+ visible agents in one region
-
-Also fixed: auto-equip was scoring weapons/armor with field names
-("damage"/"atk"/"power", "defense"/"def"/"armor") that don't exist on
-real items - every weapon scored 0 and "best weapon" was arbitrary. Real
-field is `atkBonus` for weapons and `defBonus` for armor, confirmed both
-from live game data seen earlier in this session AND from this game's
-own combat formula doc: "Base damage = attacker ATK + weapon atkBonus".
-`hpRestore` / `epRestore` for recovery items were already correct.
---------------------------------------------------------------------------
+(Mode Barbar + Dashboard UI + Smart Weapon Range + Fast DZ Escape)
 """
 
 from __future__ import annotations
@@ -50,7 +22,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 # --------------------------------------------------------------------------
-# Config
+# Config & Setup
 # --------------------------------------------------------------------------
 
 API_KEY = os.environ.get("CLAW_API_KEY", "").strip()
@@ -61,29 +33,70 @@ WS_AGENT_URL = f"wss://{BASE_HOST}/ws/agent"
 
 ENTRY_TYPE_PREFERENCE = os.environ.get("CLAW_ENTRY_TYPE", "auto").strip().lower()
 
-LOG_LEVEL = os.environ.get("CLAW_LOG_LEVEL", "INFO").upper()
+# Matikan log default INFO agar tidak merusak tampilan Dashboard
+LOG_LEVEL = os.environ.get("CLAW_LOG_LEVEL", "WARNING").upper()
 STATE_POLL_INTERVAL = float(os.environ.get("CLAW_STATE_POLL_INTERVAL", "5"))
 RECONNECT_MIN_DELAY = float(os.environ.get("CLAW_RECONNECT_MIN_DELAY", "1"))
 RECONNECT_MAX_DELAY = float(os.environ.get("CLAW_RECONNECT_MAX_DELAY", "30"))
 INTER_GAME_DELAY = float(os.environ.get("CLAW_INTER_GAME_DELAY", "3"))
 
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-    stream=sys.stdout,
-)
+logging.basicConfig(level=LOG_LEVEL, format="%(levelname)s: %(message)s", stream=sys.stdout)
 log = logging.getLogger("clawroyale")
 
+# --------------------------------------------------------------------------
+# DASHBOARD UI SYSTEM
+# --------------------------------------------------------------------------
 
-def log_info_block(title: str, fields: dict) -> None:
-    lines = [f"=== {title} ==="]
-    label_width = max((len(k) for k in fields), default=0)
-    for key, value in fields.items():
-        if value is None:
-            continue
-        lines.append(f"  {key.ljust(label_width)} : {value}")
-    log.info("\n" + "\n".join(lines))
+class Dashboard:
+    def __init__(self):
+        self.game_id = "Menunggu Match..."
+        self.hp = "N/A"
+        self.ep = "N/A"
+        self.region = "N/A"
+        self.is_dz = False
+        self.weapon = "(Kosong)"
+        self.armor = "(Kosong)"
+        self.enemies = 0
+        self.monsters = 0
+        self.loot = 0
+        self.last_action = "-"
+        self.action_status = "-"
+        self.reason = "Standby"
 
+    def render(self):
+        # ANSI Escape Code: Clear screen (\033[2J) & Move cursor to top-left (\033[H)
+        dz_warn = "⚠️ (DEATH ZONE/BAHAYA!)" if self.is_dz else "✅ (Aman)"
+        ui = f"""\033[2J\033[H
+=========================================================
+ 🤖 CLAW ROYALE BOT - DASHBOARD (MODE BARBAR)
+=========================================================
+ [ 🎮 GAME INFO ]
+ Room ID  : {self.game_id}
+
+ [ ❤️  STATUS ]
+ HP       : {self.hp}
+ EP       : {self.ep}
+ Posisi   : {self.region} {dz_warn}
+
+ [ 🛡️  EQUIPMENT ]
+ Senjata  : {self.weapon}
+ Armor    : {self.armor}
+
+ [ 👁️  VISION (RADAR) ]
+ Musuh    : {self.enemies} Agent(s) Terlihat
+ Monster  : {self.monsters} Monster(s) Terlihat
+ Loot     : {self.loot} Item(s) di Tanah
+
+ [ ⚡ LAST ACTION ]
+ Action   : {self.last_action}
+ Status   : {self.action_status}
+ Alasan   : {self.reason}
+=========================================================
+"""
+        sys.stdout.write(ui)
+        sys.stdout.flush()
+
+dash = Dashboard()
 
 # --------------------------------------------------------------------------
 # REST client
@@ -95,7 +108,6 @@ class ApiError(Exception):
         self.status = status
         self.code = code
         self.message = message
-
 
 class RestClient:
     def __init__(self, api_key: str):
@@ -112,11 +124,7 @@ class RestClient:
             await self._session.close()
 
     def _headers(self) -> dict:
-        return {
-            "X-API-Key": self.api_key,
-            "X-Version": self.version,
-            "Content-Type": "application/json",
-        }
+        return {"X-API-Key": self.api_key, "X-Version": self.version, "Content-Type": "application/json"}
 
     async def fetch_version(self) -> str:
         assert self._session
@@ -132,7 +140,6 @@ class RestClient:
         for attempt in range(3):
             async with self._session.request(method, url, headers=self._headers(), **kwargs) as resp:
                 if resp.status == 426:
-                    log.warning("426 VERSION_MISMATCH on %s — refreshing X-Version", path)
                     await self.fetch_version()
                     continue
                 text = await resp.text()
@@ -159,13 +166,10 @@ class RestClient:
     async def set_sub_pack(self, pack_instance_id: int) -> dict: return await self.request("PUT", "/loadout/sub-pack", json={"packInstanceId": pack_instance_id})
     async def equip_relic(self, type_index: int, relic_instance_id: int) -> dict: return await self.request("PUT", f"/loadout/slot/{type_index}", json={"relicInstanceId": relic_instance_id})
 
-
 async def ensure_loadout(rest: RestClient) -> None:
     try: loadout = (await rest.get_loadout()).get("data", {})
     except ApiError: return
-
     if loadout.get("fullSet"): return
-
     try:
         packs = await rest.get_inventory_packs()
         relics = await rest.get_inventory_relics()
@@ -177,11 +181,9 @@ async def ensure_loadout(rest: RestClient) -> None:
     if not active_pack and packs:
         try: await rest.set_active_pack(packs[0]["instanceId"])
         except ApiError: pass
-
     if len(packs) > 1:
         try: await rest.set_sub_pack(packs[1]["instanceId"])
         except ApiError: pass
-
     for type_index in range(3):
         if slots[type_index]: continue
         candidate = next((r for r in relics if r.get("typeIndex") == type_index), None)
@@ -196,7 +198,7 @@ async def ensure_loadout(rest: RestClient) -> None:
 
 @dataclass
 class Decision:
-    kind: str  # move, attack, explore, use_item, wait, interact, pickup, equip, talk, whisper, broadcast
+    kind: str  
     target_region_id: Optional[str] = None
     target_agent_id: Optional[str] = None
     target_monster_id: Optional[str] = None
@@ -206,63 +208,70 @@ class Decision:
     message: Optional[str] = None
     reason: str = ""
 
-
 def is_cooldown_action(kind: str) -> bool:
     return kind in {"move", "attack", "explore", "use_item", "interact", "wait", "rest"}
 
-
 def decide_free_actions(view: dict) -> list[Decision]:
-    """Free actions (0 cooldown): fast looting + smart equip (weapon + armor).
-
-    Scoring uses `atkBonus` (weapons) / `defBonus` (armor) as the primary
-    key - confirmed against real item payloads seen in this game (e.g. a
-    Pistol with atkBonus=15, a Chainmail with defBonus=12) and against
-    this game's own combat formula: damage = ATK + weapon atkBonus. The
-    old damage/atk/power/defense/def/armor keys are kept as harmless
-    fallbacks in case a future item type uses different naming, but they
-    don't exist on any item schema seen so far.
-    """
+    """Free actions (0 cooldown): fast looting + smart equip (Jarak Musuh vs Weapon)."""
     free_decisions = []
     self_state = view.get("self", {}) or {}
     inventory = self_state.get("inventory") or []
     equipped_weapon = self_state.get("equippedWeapon")
     equipped_armor = self_state.get("equippedArmor")
+    
+    # Deteksi Musuh Terdekat untuk Smart Weapon Switch
+    visible_agents = view.get("visibleAgents") or []
+    visible_monsters = view.get("visibleMonsters") or []
+    all_enemies = visible_agents + visible_monsters
+    
+    target_distance = 0
+    if all_enemies:
+        closest = min(all_enemies, key=lambda e: e.get("distance", 0))
+        target_distance = closest.get("distance", 0)
 
     # ---------------------------------------------------------
-    # 1. AUTO-EQUIP SENJATA TERBAIK
+    # 1. SMART AUTO-EQUIP SENJATA (RANGE VS MELEE)
     # ---------------------------------------------------------
     all_weapons = [i for i in inventory if i.get("category") == "weapon"]
-
     if equipped_weapon:
         if isinstance(equipped_weapon, dict) and equipped_weapon.get("category") == "weapon":
             all_weapons.append(equipped_weapon)
 
     if all_weapons:
         def weapon_score(w):
-            return w.get("atkBonus", 0) or w.get("damage", 0) or w.get("atk", 0) or w.get("power", 0) or 0
+            atk = w.get("atkBonus", 0) or w.get("damage", 0) or w.get("atk", 0) or w.get("power", 0) or 0
+            w_range = w.get("range", 1) # Default 1 (Melee) kalau tidak ada info
+
+            if target_distance > 1:
+                # Musuh Jauh -> Prioritaskan Senjata Ranged (Range > 1)
+                if w_range > 1: return atk + 1000 
+                return atk
+            else:
+                # Musuh Dekat -> Prioritaskan Senjata Melee/ATK Terbesar
+                if w_range <= 1: return atk + 1000
+                return atk
 
         best_weapon = max(all_weapons, key=weapon_score)
-
+        
         is_already_equipped = False
         if equipped_weapon:
             if isinstance(equipped_weapon, dict) and equipped_weapon.get("id") == best_weapon.get("id"):
                 is_already_equipped = True
             elif isinstance(equipped_weapon, str) and equipped_weapon == best_weapon.get("id"):
                 is_already_equipped = True
-
+                
         if not is_already_equipped and best_weapon.get("id"):
-            atk = weapon_score(best_weapon)
+            w_type = "RANGED" if best_weapon.get("range", 1) > 1 else "MELEE"
             free_decisions.append(Decision(
-                kind="equip",
-                item_id=best_weapon.get("id"),
-                reason=f"auto-equip senjata TERKUAT: {best_weapon.get('name')} (atkBonus: {atk})"
+                kind="equip", 
+                item_id=best_weapon.get("id"), 
+                reason=f"Switch Senjata ({w_type}): {best_weapon.get('name')}"
             ))
 
     # ---------------------------------------------------------
     # 2. AUTO-EQUIP ARMOR TERBAIK
     # ---------------------------------------------------------
     all_armors = [i for i in inventory if i.get("category") in ["armor", "equipment"]]
-
     if equipped_armor:
         if isinstance(equipped_armor, dict):
             all_armors.append(equipped_armor)
@@ -270,22 +279,21 @@ def decide_free_actions(view: dict) -> list[Decision]:
     if all_armors:
         def armor_score(a):
             return a.get("defBonus", 0) or a.get("defense", 0) or a.get("def", 0) or a.get("armor", 0) or a.get("hpMax", 0) or 0
-
         best_armor = max(all_armors, key=armor_score)
-
+        
         is_already_equipped_armor = False
         if equipped_armor:
             if isinstance(equipped_armor, dict) and equipped_armor.get("id") == best_armor.get("id"):
                 is_already_equipped_armor = True
             elif isinstance(equipped_armor, str) and equipped_armor == best_armor.get("id"):
                 is_already_equipped_armor = True
-
+                
         if not is_already_equipped_armor and best_armor.get("id"):
             def_val = armor_score(best_armor)
             free_decisions.append(Decision(
-                kind="equip",
-                item_id=best_armor.get("id"),
-                reason=f"auto-equip ARMOR TERKUAT: {best_armor.get('name')} (defBonus: {def_val})"
+                kind="equip", 
+                item_id=best_armor.get("id"), 
+                reason=f"Auto-equip Armor: {best_armor.get('name')} (DEF: {def_val})"
             ))
 
     # ---------------------------------------------------------
@@ -294,32 +302,29 @@ def decide_free_actions(view: dict) -> list[Decision]:
     raw_visible_items = []
     if isinstance(view.get("visibleItems"), list):
         raw_visible_items.extend(view.get("visibleItems"))
-
+        
     current_region = view.get("currentRegion") or {}
     for key in ["items", "groundItems", "droppedItems"]:
         if isinstance(current_region.get(key), list):
             raw_visible_items.extend(current_region.get(key))
 
     unique_items = {item.get("id"): item for item in raw_visible_items if item.get("id")}
-
     if unique_items:
         inv_count = len(inventory)
         for item_id, item in unique_items.items():
-            if inv_count >= 10:
-                break  # Mentok 10 slot max
+            if inv_count >= 10: break
             free_decisions.append(Decision(
                 kind="pickup",
                 item_id=item_id,
-                reason=f"⚡ FAST LOOT: Mengambil {item.get('name', 'Unknown Item')}"
+                reason=f"⚡ FAST LOOT: Ambil {item.get('name', 'Item')}"
             ))
             inv_count += 1
 
     return free_decisions
 
 
-def decide(view: dict) -> Decision:
-    """Cooldown-group action. See the module-level tuning notes at the top
-    of this file for why the two safety checks below exist."""
+def decide(view: dict, session: GameSession) -> Decision:
+    """Action Utama (Cooldown Action)."""
     self_state = view.get("self", {}) or {}
     hp = self_state.get("hp", 100)
     max_hp_guess = self_state.get("maxHp", 100) or 100
@@ -334,7 +339,6 @@ def decide(view: dict) -> Decision:
     pending_deathzones = view.get("pendingDeathzones") or []
 
     hp_ratio = hp / max_hp_guess if max_hp_guess else 1.0
-
     inventory_items = self_state.get("inventory") or []
     recovery_items = [i for i in inventory_items if i.get("category") in ["recovery", "consumable"]]
 
@@ -342,95 +346,82 @@ def decide(view: dict) -> Decision:
     # 1. SURVIVAL & RECOVERY
     # ---------------------------------------------------------
 
-    # 1.1) Death zone -> always leave, no exceptions.
+    # 1.1) FAST DEATH ZONE ESCAPE (Cari Jalur 100% Aman)
     pending_here_ids = {dz.get("id") for dz in pending_deathzones}
     if is_death_zone or current_region.get("id") in pending_here_ids:
-        safe_targets = [c for c in connections]
+        # Coret jalur yang mau meledak
+        safe_targets = [c for c in connections if c not in pending_here_ids]
         if safe_targets:
-            return Decision(kind="move", target_region_id=random.choice(safe_targets), reason="evacuating death zone")
+            # Utamakan jalur yang tidak ada history bahaya
+            really_safe = [c for c in safe_targets if c not in session.dangerous_regions]
+            chosen = random.choice(really_safe) if really_safe else random.choice(safe_targets)
+            return Decision(kind="move", target_region_id=chosen, reason="🚨 KABUR CEPAT DARI DEATH ZONE!")
+        elif connections:
+            # Darurat: Semua jalur mau meledak, pokoknya pindah dulu!
+            return Decision(kind="move", target_region_id=random.choice(connections), reason="🚨 KABUR DARURAT! (Semua zona bahaya)")
 
-    # 1.2) Auto-heal when hurt.
-    if hp_ratio < 0.60 and recovery_items:
+    # 1.2) EARLY AUTO-HEAL (Naik ke 85%)
+    if hp_ratio < 0.85 and recovery_items:
         best_hp_item = max(recovery_items, key=lambda i: i.get("hpRestore", 0))
         if best_hp_item.get("hpRestore", 0) > 0:
-            return Decision(kind="use_item", item_id=best_hp_item.get("id"), reason=f"auto-heal: using {best_hp_item.get('name')}")
+            return Decision(kind="use_item", item_id=best_hp_item.get("id"), reason=f"💊 Auto-Heal Dini: Pakai {best_hp_item.get('name')}")
 
-    # 1.3) Critical HP with NO heal item left -> the one hard retreat in
-    #    this bot. Ranking is alive > survival time > kills; dying here
-    #    forfeits everything already earned this game for nothing. Only
-    #    reachable when 1.2 couldn't heal (no item, or item exhausted).
+    # 1.3) Critical HP + No Potions -> Hard Retreat
     if hp_ratio < 0.25:
         if connections:
-            return Decision(kind="move", target_region_id=random.choice(connections), reason=f"critical HP ({hp_ratio:.0%}), no heal item — forced retreat to stay alive")
-        return Decision(kind="wait", reason=f"critical HP ({hp_ratio:.0%}), no heal item, no exit")
+            return Decision(kind="move", target_region_id=random.choice(connections), reason=f"HP Sekarat ({hp_ratio:.0%}) & Habis Potion — Mundur!")
+        return Decision(kind="wait", reason=f"HP Sekarat ({hp_ratio:.0%}) & Habis Potion, Tapi tidak ada jalan keluar.")
 
-    # 1.4) Auto-Energy (Isi Stamina jika EP < 2 supaya bisa nyerang terus)
+    # 1.4) Auto-Energy
     if ep < 2 and recovery_items:
-        def ep_score(i):
-            return i.get("epRestore", 0) or i.get("spRestore", 0) or i.get("energyRestore", 0) or 0
-
+        def ep_score(i): return i.get("epRestore", 0) or i.get("spRestore", 0) or i.get("energyRestore", 0) or 0
         best_ep_item = max(recovery_items, key=ep_score)
         if ep_score(best_ep_item) > 0:
-            return Decision(kind="use_item", item_id=best_ep_item.get("id"), reason=f"auto-energy: ngisi stamina pakai {best_ep_item.get('name')}")
+            return Decision(kind="use_item", item_id=best_ep_item.get("id"), reason=f"🔋 Isi Stamina: Pakai {best_ep_item.get('name')}")
 
-    # 1.5) Extremely crowded region -> reposition instead of picking a
-    #    fight here. High threshold on purpose: normal 1-3 agent
-    #    skirmishes below this are completely untouched. Grounded in an
-    #    earlier live incident where big unexplained HP drops correlated
-    #    specifically with 15-19+ visible agents in one region.
-    CROWDED_THRESHOLD = 12
-    if len(visible_agents) > CROWDED_THRESHOLD and connections:
-        return Decision(
-            kind="move", target_region_id=random.choice(connections),
-            reason=f"extremely crowded ({len(visible_agents)} agents visible) — repositioning before engaging",
-        )
+    # 1.5) Hindari Kerumunan Massal (>12 orang)
+    if len(visible_agents) > 12 and connections:
+        return Decision(kind="move", target_region_id=random.choice(connections), reason="⚠️ Terlalu ramai (>12 agent), Reposisi!")
 
     # ---------------------------------------------------------
-    # 2. FIGHT — aggressive, but skip fights that are clearly hopeless
-    #    rather than trading survival time for them.
+    # 2. FIGHT (AGRESIF)
     # ---------------------------------------------------------
-
     if visible_agents and ep > 0:
         non_guardian = [a for a in visible_agents if not a.get("isGuardian")]
-        # Generous on purpose - only filters out targets with a big HP
-        # edge over us, not just anyone tougher. Falls back to the full
-        # pool if that's genuinely all there is and we're still healthy.
         winnable = [a for a in non_guardian if a.get("hp", 999) <= hp * 1.5]
         pool = winnable or non_guardian
         if pool and hp_ratio >= 0.45:
             weakest = min(pool, key=lambda a: a.get("hp", 999))
-            return Decision(kind="attack", target_agent_id=weakest.get("id"), reason="MODE AGRESIF: menghajar agent terlemah yang realistis dimenangkan")
+            return Decision(kind="attack", target_agent_id=weakest.get("id"), reason="⚔️ SERANG! Menghajar Agent terlemah.")
 
     if visible_monsters and ep > 0 and hp_ratio >= 0.35:
         weakest_monster = min(visible_monsters, key=lambda m: m.get("hp", 999))
-        return Decision(kind="attack", target_monster_id=weakest_monster.get("id"), reason="MODE AGRESIF: menghabisi monster untuk loot")
+        return Decision(kind="attack", target_monster_id=weakest_monster.get("id"), reason="⚔️ SERANG! Menghabisi Monster untuk loot.")
 
     # ---------------------------------------------------------
     # 3. INTERAKSI & EKSPLORASI
     # ---------------------------------------------------------
-
     if in_cave:
         facilities = view.get("visibleFacilities") or current_region.get("facilities") or current_region.get("interactables") or []
         if facilities:
-            return Decision(kind="interact", interactable_id=facilities[0].get("id"), reason="using facility to exit cave")
-        return Decision(kind="interact", reason="in cave — attempting generic interact to exit")
+            return Decision(kind="interact", interactable_id=facilities[0].get("id"), reason="Keluar dari Gua (Cave).")
+        return Decision(kind="interact", reason="Mencoba keluar dari Gua (Cave).")
 
     alert_active = self_state.get("alertActive", False)
     alert_gauge = self_state.get("alertGauge", 0) or 0
     if visible_ruins and not alert_active and alert_gauge <= 6:
         ruin = next((r for r in visible_ruins if not r.get("isEmpty")), None)
         if ruin:
-            return Decision(kind="explore", ruin_id=ruin.get("ruinId"), reason=f"exploring ruin (alertGauge={alert_gauge})")
+            return Decision(kind="explore", ruin_id=ruin.get("ruinId"), reason=f"Eksplorasi Ruin (Alert: {alert_gauge})")
 
     if connections:
-        return Decision(kind="move", target_region_id=random.choice(connections), reason="Hunting: mencari musuh/loot di region lain")
+        return Decision(kind="move", target_region_id=random.choice(connections), reason="Hunting: Mencari musuh di region lain.")
 
-    return Decision(kind="wait", reason="no connections and nothing to do")
+    return Decision(kind="wait", reason="Standby, tidak ada aksi tersedia.")
 
 
 def build_action_payload(decision: Decision) -> dict:
     data: dict[str, Any] = {}
-
     if decision.kind == "move" and decision.target_region_id:
         data = {"type": "move", "regionId": decision.target_region_id}
     elif decision.kind == "attack":
@@ -438,32 +429,22 @@ def build_action_payload(decision: Decision) -> dict:
         if target_id:
             target_type = "agent" if decision.target_agent_id else "monster"
             data = {"type": "attack", "targetId": target_id, "targetType": target_type}
-    elif decision.kind == "explore":
-        data = {"type": "explore"}
-    elif decision.kind == "use_item" and decision.item_id:
-        data = {"type": "use_item", "itemId": decision.item_id}
+    elif decision.kind == "explore": data = {"type": "explore"}
+    elif decision.kind == "use_item" and decision.item_id: data = {"type": "use_item", "itemId": decision.item_id}
     elif decision.kind == "interact":
         data = {"type": "interact"}
-        if decision.interactable_id:
-            data["interactableId"] = decision.interactable_id
-    elif decision.kind == "pickup" and decision.item_id:
-        data = {"type": "pickup", "itemId": decision.item_id}
-    elif decision.kind == "equip" and decision.item_id:
-        data = {"type": "equip", "itemId": decision.item_id}
-    elif decision.kind == "talk" and decision.message:
-        data = {"type": "talk", "message": decision.message[:200]}
+        if decision.interactable_id: data["interactableId"] = decision.interactable_id
+    elif decision.kind == "pickup" and decision.item_id: data = {"type": "pickup", "itemId": decision.item_id}
+    elif decision.kind == "equip" and decision.item_id: data = {"type": "equip", "itemId": decision.item_id}
+    elif decision.kind == "talk" and decision.message: data = {"type": "talk", "message": decision.message[:200]}
     elif decision.kind == "whisper" and decision.target_agent_id and decision.message:
         data = {"type": "whisper", "targetId": decision.target_agent_id, "message": decision.message[:200]}
-    elif decision.kind == "broadcast" and decision.message:
-        data = {"type": "broadcast", "message": decision.message[:500]}
-    elif decision.kind == "wait":
-        data = {"type": "rest"}
-    else:
-        data = {"type": decision.kind}
+    elif decision.kind == "broadcast" and decision.message: data = {"type": "broadcast", "message": decision.message[:500]}
+    elif decision.kind == "wait": data = {"type": "rest"}
+    else: data = {"type": decision.kind}
 
     payload: dict[str, Any] = {"type": "action", "data": data}
-    if decision.reason:
-        payload["thought"] = {"reasoning": decision.reason[:500]}
+    if decision.reason: payload["thought"] = {"reasoning": decision.reason[:500]}
     return payload
 
 
@@ -490,13 +471,7 @@ class GameSession:
     last_move_target_region: Optional[str] = None
     consecutive_failed_moves: int = 0
     last_explored_ruin_id: Optional[str] = None
-    # Dedup guard for free actions (pickup/equip): without this, calling
-    # maybe_act multiple times against the same stale view (e.g. two
-    # can_act_changed frames before a fresh agent_view arrives) would
-    # resend the exact same pickup/equip repeatedly. Cleared whenever a
-    # genuinely new agent_view/turn_advanced/handover_sync frame arrives.
     recently_attempted_free_actions: set = field(default_factory=set)
-
 
 def get_target_current_hp(view: dict, target_id: str) -> Optional[int]:
     for a in (view.get("visibleAgents") or []):
@@ -508,50 +483,56 @@ def get_target_current_hp(view: dict, target_id: str) -> Optional[int]:
 async def send_hello(ws, entry_type: str) -> None:
     hello = {"type": "hello", "entryType": entry_type}
     await ws.send(json.dumps(hello))
-    log.info("sent hello entryType=%s", entry_type)
+
+async def update_dashboard_state(view: dict, session: GameSession):
+    """Memperbarui variabel dashboard agar sinkron dengan data server"""
+    self_state = view.get("self", {}) or {}
+    dash.hp = f"{self_state.get('hp', 0)}/{self_state.get('maxHp', 0)}"
+    dash.ep = str(self_state.get("ep", 0))
+    
+    current_region = view.get("currentRegion", {}) or {}
+    dash.region = current_region.get("id", "N/A")
+    
+    pending = {dz.get("id") for dz in (view.get("pendingDeathzones") or [])}
+    dash.is_dz = current_region.get("isDeathZone", False) or dash.region in pending
+    
+    dash.enemies = len(view.get("visibleAgents") or [])
+    dash.monsters = len(view.get("visibleMonsters") or [])
+    
+    raw_items = (view.get("visibleItems") or []) + (current_region.get("items") or []) + (current_region.get("groundItems") or [])
+    dash.loot = len(raw_items)
+
+    equipped_w = self_state.get("equippedWeapon")
+    dash.weapon = equipped_w.get("name") if isinstance(equipped_w, dict) else (str(equipped_w) if equipped_w else "(Kosong)")
+    
+    equipped_a = self_state.get("equippedArmor")
+    dash.armor = equipped_a.get("name") if isinstance(equipped_a, dict) else (str(equipped_a) if equipped_a else "(Kosong)")
 
 async def maybe_act(ws, session: GameSession, view: dict) -> None:
-    if not view:
-        return
-
+    if not view: return
     self_state = view.get("self", {}) or {}
-    if self_state.get("isAlive") is False:
-        return
+    if self_state.get("isAlive") is False: return
 
-    hp = self_state.get("hp")
-
-    # ----- PROSES FREE ACTIONS (Flash Looting & Smart Equip) -----
+    # ----- PROSES FREE ACTIONS -----
     free_actions = decide_free_actions(view)
     for fd in free_actions:
         dedup_key = f"{fd.kind}:{fd.item_id or fd.interactable_id or fd.message}"
-        if dedup_key in session.recently_attempted_free_actions:
-            continue
+        if dedup_key in session.recently_attempted_free_actions: continue
         session.recently_attempted_free_actions.add(dedup_key)
+        
         payload = build_action_payload(fd)
-        log_info_block("Aksi Bebas (No Cooldown)", {
-            "action": fd.kind,
-            "target/item": fd.item_id or fd.interactable_id or fd.message,
-            "alasan": fd.reason
-        })
+        dash.last_action = fd.kind.upper()
+        dash.reason = fd.reason
+        dash.action_status = "Terkirim (No Cooldown)"
+        dash.render()
+        
         await ws.send(json.dumps(payload))
-        # Jeda super cepat 0.01 detik agar server tidak pusing tapi barang kesapu bersih
         await asyncio.sleep(0.01)
 
-    # ----- PROSES MAIN ACTION (Cooldown Group) -----
-    if not session.can_act:
-        log.debug("canAct is false — waiting for can_act_changed before acting (main action)")
-        return
+    # ----- PROSES MAIN ACTION -----
+    if not session.can_act: return
 
-    working_view = view
-    if session.dangerous_regions:
-        region = view.get("currentRegion") or {}
-        connections = region.get("connections") or []
-        safe_connections = [c for c in connections if c not in session.dangerous_regions]
-        if safe_connections and len(safe_connections) < len(connections):
-            working_view = dict(view)
-            working_view["currentRegion"] = {**region, "connections": safe_connections}
-
-    decision = decide(working_view)
+    decision = decide(view, session)
     current_target = decision.ruin_id or decision.target_monster_id or decision.target_agent_id
 
     if decision.kind == "attack" and current_target:
@@ -564,31 +545,23 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
         target_healing = (is_same_target_as_last_attack and previously_seen_hp is not None and current_target_hp is not None and current_target_hp > previously_seen_hp)
 
         if target_confirmed_dead or no_damage_landed or target_healing:
-            log.warning("redirecting away from stuck attack target=%s (confirmedDead=%s noDamageLanded=%s targetHealing=%s)", current_target, target_confirmed_dead, no_damage_landed, target_healing)
             connections = (view.get("currentRegion") or {}).get("connections") or []
-            if connections:
-                decision = Decision(kind="move", target_region_id=random.choice(connections), reason="redirecting off a dead/stuck attack target")
-            else:
-                decision = Decision(kind="wait", reason="dead/stuck target, no exit")
+            if connections: decision = Decision(kind="move", target_region_id=random.choice(connections), reason="Redirect (Target Stuck/Mati)")
+            else: decision = Decision(kind="wait", reason="Target mati/stuck tapi tidak ada jalan.")
             current_target = None
         else:
-            if current_target_hp is not None:
-                session.last_seen_target_hp[current_target] = current_target_hp
+            if current_target_hp is not None: session.last_seen_target_hp[current_target] = current_target_hp
             session.last_action_target = current_target
 
     elif decision.kind == "explore" and current_target:
-        if current_target == session.last_explored_ruin_id:
-            session.consecutive_same_target += 1
-        else:
-            session.consecutive_same_target = 0
+        if current_target == session.last_explored_ruin_id: session.consecutive_same_target += 1
+        else: session.consecutive_same_target = 0
         session.last_explored_ruin_id = current_target
 
         if session.consecutive_same_target >= 1:
             connections = (view.get("currentRegion") or {}).get("connections") or []
-            if connections:
-                decision = Decision(kind="move", target_region_id=random.choice(connections), reason="breaking repeated-explore loop for safety")
-            else:
-                decision = Decision(kind="wait", reason="breaking repeat loop, no exit")
+            if connections: decision = Decision(kind="move", target_region_id=random.choice(connections), reason="Mencegah loop eksplorasi.")
+            else: decision = Decision(kind="wait", reason="Terjebak loop eksplorasi.")
             session.consecutive_same_target = 0
             session.last_explored_ruin_id = None
             session.last_action_target = None
@@ -603,14 +576,12 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
         session.last_move_target_region = decision.target_region_id
 
     payload = build_action_payload(decision)
-    target_display = decision.target_region_id or decision.target_agent_id or decision.target_monster_id or decision.ruin_id or decision.interactable_id
-
-    log_info_block("Aksi Utama", {
-        "action": decision.kind,
-        "target": target_display,
-        "alasan": decision.reason,
-        "hp saat ini": hp,
-    })
+    
+    # Update Dashboard
+    dash.last_action = decision.kind.upper()
+    dash.reason = decision.reason
+    dash.action_status = "Terkirim (Cooldown)"
+    dash.render()
 
     await ws.send(json.dumps(payload))
 
@@ -619,142 +590,64 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
 
 async def play_session(ws, session: GameSession) -> str:
     async for raw in ws:
-        try:
-            frame = json.loads(raw)
-        except json.JSONDecodeError:
-            continue
+        try: frame = json.loads(raw)
+        except json.JSONDecodeError: continue
 
         ftype = frame.get("type")
 
         if ftype == "welcome":
-            decision = frame.get("decision")
-            if decision == "BLOCKED": return "closed"
+            if frame.get("decision") == "BLOCKED": return "closed"
         elif ftype in ("assigned"):
             session.game_id = frame.get("gameId")
-            log_info_block("Masuk Room", {"room/game id": session.game_id, "entry type": session.entry_type})
+            dash.game_id = session.game_id
+            dash.render()
         elif ftype in ("agent_view", "turn_advanced", "handover_sync", "action_rejected"):
             view = frame.get("view", {})
-
             if ftype != "action_rejected":
-                # A genuinely new world-state snapshot arrived — safe to
-                # retry any free actions that were deduped against the
-                # previous (now stale) view.
                 session.recently_attempted_free_actions.clear()
-
-                current_region = view.get("currentRegion", {}) or {}
-                current_region_id = current_region.get("id")
-                new_self = view.get("self") or {}
-                new_hp = new_self.get("hp")
-                new_max_hp = new_self.get("maxHp")
-                visible_agents = view.get("visibleAgents") or []
-                visible_monsters = view.get("visibleMonsters") or []
-                visible_ruins = view.get("visibleRuins") or []
-
+                current_region_id = (view.get("currentRegion") or {}).get("id")
+                
                 if session.last_move_target_region is not None:
-                    moved_from = session.region_before_last_move
-                    if current_region_id == moved_from:
+                    if current_region_id == session.region_before_last_move:
                         session.consecutive_failed_moves += 1
-                        if session.consecutive_failed_moves >= 3:
-                            log.warning(
-                                "move hasn't changed region in %d consecutive attempts "
-                                "(stuck in %s) — worth a look if this keeps happening",
-                                session.consecutive_failed_moves, moved_from,
-                            )
                     else:
                         session.consecutive_failed_moves = 0
                     session.last_move_target_region = None
                     session.region_before_last_move = None
 
-                hp_display = f"{new_hp}/{new_max_hp}" if new_max_hp else str(new_hp)
-                reason = frame.get("reason")
-
-                log_info_block("Status", {
-                    "turn": frame.get("turn"),
-                    "hp": hp_display,
-                    "ep": new_self.get("ep"),
-                    "bisa aksi": session.can_act,
-                    "posisi (region)": current_region_id,
-                    "death zone": current_region.get("isDeathZone"),
-                    "musuh terlihat": len(visible_agents) or None,
-                    "monster terlihat": len(visible_monsters) or None,
-                    "ruin terlihat": len(visible_ruins) or None,
-                    "update type": f"{ftype} ({reason})" if reason else ftype,
-                })
-
-                equipped_weapon = new_self.get("equippedWeapon")
-                equipped_armor = new_self.get("equippedArmor")
-                inventory_items = new_self.get("inventory") or []
-                equip_signature = json.dumps({"weapon": equipped_weapon, "armor": equipped_armor, "inventory": inventory_items}, sort_keys=True)
-
-                if equip_signature != session.last_equipment_signature:
-                    session.last_equipment_signature = equip_signature
-                    item_lines = {it.get("name", f"item {i}"): f"x{it.get('quantity', 1)}" for i, it in enumerate(inventory_items)}
-                    weapon_name = equipped_weapon.get("name") if isinstance(equipped_weapon, dict) else equipped_weapon
-                    armor_name = equipped_armor.get("name") if isinstance(equipped_armor, dict) else equipped_armor
-                    log_info_block("Equipment", {
-                        "weapon": weapon_name or "(kosong)",
-                        "armor": armor_name or "(kosong)",
-                        **(item_lines or {"item": "(kosong)"}),
-                    })
-
             session.last_view = view
             session.last_view_turn = frame.get("turn")
-
+            
+            await update_dashboard_state(view, session)
+            dash.render()
+            
             await maybe_act(ws, session, view)
 
         elif ftype == "action_result":
-            if "success" in frame:
-                success = frame.get("success")
-            else:
-                log.warning("action_result missing 'success' entirely — treating as failure: %s", frame)
-                success = False
+            success = frame.get("success", False)
             can_act = frame.get("canAct")
-            if can_act is not None:
-                session.can_act = can_act
+            if can_act is not None: session.can_act = can_act
 
             error = frame.get("error") or {}
             if not success:
-                # last_action_target only tracks attack/explore targets -
-                # for a failed move, show the move's actual target region
-                # instead of a stale attack target id.
-                failed_target = (
-                    session.last_move_target_region
-                    if session.last_decision_kind == "move"
-                    else session.last_action_target
-                )
-                log_info_block("⚠️ AKSI GAGAL (action_result)", {
-                    "action yang dikirim": session.last_decision_kind,
-                    "target": failed_target,
-                    "error code": error.get("code"),
-                    "error message": error.get("message"),
-                    "canAct": can_act,
-                })
-
-            if error.get("code") == "TARGET_DEAD" and session.last_action_target:
-                session.confirmed_dead_targets.add(session.last_action_target)
-
-            # An explicit rejection (e.g. COOLDOWN_ACTIVE right after a
-            # TARGET_DEAD redirect, when our client-side can_act tracking
-            # was briefly ahead of the server's real cooldown state)
-            # already explains exactly why this move failed. Don't also
-            # let the generic silent-move diagnostic below pile a
-            # "N consecutive failures" warning on top of an
-            # already-understood, unrelated failure mode - that
-            # diagnostic exists specifically to catch moves the server
-            # reports as successful but silently doesn't apply.
-            if (
-                not success
-                and session.last_decision_kind == "move"
-                and session.last_move_target_region is not None
-            ):
-                session.consecutive_failed_moves = 0
-                session.last_move_target_region = None
-                session.region_before_last_move = None
+                if error.get("code") == "TARGET_DEAD" and session.last_action_target:
+                    session.confirmed_dead_targets.add(session.last_action_target)
+                if session.last_decision_kind == "move" and session.last_move_target_region is not None:
+                    session.consecutive_failed_moves = 0
+                    session.last_move_target_region = None
+                    session.region_before_last_move = None
+                
+                dash.action_status = f"GAGAL ({error.get('code', 'Unknown Error')})"
+            else:
+                dash.action_status = "SUKSES"
+            dash.render()
 
             inline_view = frame.get("view")
             if inline_view:
                 session.last_view = inline_view
                 session.last_view_turn = frame.get("turn", session.last_view_turn)
+                await update_dashboard_state(inline_view, session)
+                dash.render()
 
         elif ftype == "can_act_changed":
             session.can_act = frame.get("canAct", True)
@@ -765,35 +658,26 @@ async def play_session(ws, session: GameSession) -> str:
             meta = frame.get("meta", {}) or {}
             if meta.get("youDied"):
                 session.alive = False
+                dash.action_status = "MATI"
+                dash.render()
                 return "died"
         elif ftype == "game_ended":
+            dash.action_status = "GAME SELESAI"
+            dash.render()
             return "ended"
 
     return "closed"
 
 async def run_one_game(rest: RestClient, entry_type: str) -> str:
-    headers = {
-        "X-API-Key": rest.api_key,
-        "X-Version": rest.version,
-    }
-
+    headers = {"X-API-Key": rest.api_key, "X-Version": rest.version}
     try:
-        async with websockets.connect(
-            WS_JOIN_URL, additional_headers=headers, ping_interval=20, ping_timeout=20
-        ) as ws:
-            welcome_raw = await ws.recv()
-            welcome = json.loads(welcome_raw)
-
-            if welcome.get("type") == "welcome":
-                decision = welcome.get("decision")
-                if decision == "BLOCKED":
-                    return "blocked"
-
+        async with websockets.connect(WS_JOIN_URL, additional_headers=headers, ping_interval=20, ping_timeout=20) as ws:
+            welcome = json.loads(await ws.recv())
+            if welcome.get("type") == "welcome" and welcome.get("decision") == "BLOCKED":
+                return "blocked"
             await send_hello(ws, entry_type)
             session = GameSession(entry_type=entry_type)
-            outcome = await play_session(ws, session)
-            return outcome
-
+            return await play_session(ws, session)
     except ConnectionClosed as e:
         if e.code == 1013: return "resume_dead"
         if e.code == 4032: return "died"
@@ -805,39 +689,26 @@ async def choose_entry_type(rest: RestClient) -> Optional[str]:
     current_games = me.get("currentGames", []) or []
 
     def live(entry: str) -> bool:
-        return any(
-            g.get("entryType") == entry
-            and g.get("isAlive")
-            and g.get("gameStatus") != "finished"
-            for g in current_games
-        )
+        return any(g.get("entryType") == entry and g.get("isAlive") and g.get("gameStatus") != "finished" for g in current_games)
 
     free_live = live("free")
     paid_live = live("paid")
 
     if ENTRY_TYPE_PREFERENCE == "paid":
-        if paid_live or readiness.get("paidReady"): return "paid"
-        return "free"
-
-    if ENTRY_TYPE_PREFERENCE == "free":
-        return "free"
-
+        return "paid" if paid_live or readiness.get("paidReady") else "free"
+    if ENTRY_TYPE_PREFERENCE == "free": return "free"
     if paid_live: return "paid"
     if free_live: return "free"
     if readiness.get("paidReady"): return "paid"
     return "free"
 
-
 async def main_loop() -> None:
     if not API_KEY:
-        log.error("CLAW_API_KEY is not set — see .env.example")
+        print("CLAW_API_KEY is not set — see .env.example")
         sys.exit(1)
 
     stop = asyncio.Event()
-
-    def _handle_signal(*_args):
-        log.info("shutdown signal received")
-        stop.set()
+    def _handle_signal(*_args): stop.set()
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -847,18 +718,9 @@ async def main_loop() -> None:
     async with RestClient(API_KEY) as rest:
         await rest.fetch_version()
         try:
-            me = await rest.get_me()
-            readiness = me.get("readiness", {}) or {}
-            log_info_block("Akun", {
-                "nama": me.get("name"),
-                "balance": f"{me.get('balance')} sMoltz",
-                "wallet ok": readiness.get("walletAddress"),
-                "whitelist": readiness.get("whitelistApproved"),
-                "sMoltz cukup": readiness.get("sMoltzSufficient"),
-                "paid ready": readiness.get("paidReady"),
-            })
-        except ApiError as e:
-            log.error("could not fetch account — check CLAW_API_KEY: %s", e)
+            await rest.get_me()
+        except ApiError:
+            print("API Error — check CLAW_API_KEY")
             sys.exit(1)
 
         reconnect_delay = RECONNECT_MIN_DELAY
@@ -871,27 +733,22 @@ async def main_loop() -> None:
                     continue
 
                 await ensure_loadout(rest)
+                dash.game_id = "Mencari Matchmaking..."
+                dash.render()
                 outcome = await run_one_game(rest, entry_type)
 
                 if outcome in ("died", "ended", "resume_dead"):
                     reconnect_delay = RECONNECT_MIN_DELAY
                     await asyncio.sleep(INTER_GAME_DELAY)
-                elif outcome == "blocked":
-                    await asyncio.sleep(STATE_POLL_INTERVAL)
+                elif outcome == "blocked": await asyncio.sleep(STATE_POLL_INTERVAL)
                 else:
                     await asyncio.sleep(reconnect_delay)
                     reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
-
-            except ApiError:
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
-            except (ConnectionClosed, OSError):
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
             except Exception:
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
 
-
 if __name__ == "__main__":
+    # Paksa clear screen awal
+    sys.stdout.write("\033[2J\033[H")
     asyncio.run(main_loop())
