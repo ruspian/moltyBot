@@ -37,7 +37,6 @@ WS_JOIN_URL = f"wss://{BASE_HOST}/ws/join"
 WS_AGENT_URL = f"wss://{BASE_HOST}/ws/agent"
 
 ENTRY_TYPE_PREFERENCE = os.environ.get("CLAW_ENTRY_TYPE", "auto").strip().lower()
-# "auto" -> paid if ready else free ; "free" ; "paid"
 
 LOG_LEVEL = os.environ.get("CLAW_LOG_LEVEL", "INFO").upper()
 STATE_POLL_INTERVAL = float(os.environ.get("CLAW_STATE_POLL_INTERVAL", "5"))
@@ -79,7 +78,7 @@ class ApiError(Exception):
 class RestClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.version = "1"  # refreshed by fetch_version()
+        self.version = "1"
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self) -> "RestClient":
@@ -243,7 +242,7 @@ async def ensure_loadout(rest: RestClient) -> None:
 
 
 # --------------------------------------------------------------------------
-# Decision logic (AGRESIF / BARBAR / INCAR KILL)
+# Decision logic (MODE PEMULUNG / SURVIVAL)
 # --------------------------------------------------------------------------
 
 @dataclass
@@ -261,8 +260,7 @@ def is_cooldown_action(kind: str) -> bool:
 
 
 def decide(view: dict) -> Decision:
-    """Pure function: game view -> next action. Keep this readable and
-    tune it here — this is the whole 'strategy' of the bot."""
+    """Mode: Scavenger/Pemulung. Fokus loot, jauhi pertarungan, bertahan hidup."""
 
     self_state = view.get("self", {}) or {}
     hp = self_state.get("hp", 100)
@@ -287,87 +285,87 @@ def decide(view: dict) -> Decision:
             return Decision(
                 kind="move",
                 target_region_id=random.choice(safe_targets),
-                reason="evacuating death zone",
+                reason="evakuasi dari death zone mutlak",
             )
 
-    # 2) LOGIKA BARU: HAJAR MUSUH HP TERENDAH (Prioritas cari Kill)
-    # Cek apakah ada agent/player lain dan bot punya EP untuk nyerang
-    if visible_agents and ep > 0:
-        # Filter biar gak nyerang Guardian
-        non_guardian_targets = [a for a in visible_agents if not a.get("isGuardian")]
-        
-        if non_guardian_targets:
-            # Cari agent dengan HP paling rendah mutlak
-            weakest = min(non_guardian_targets, key=lambda a: a.get("hp", 999))
-            
-            # Asalkan HP bot tidak kritis banget (di atas 20%), sikat musuh yang paling lemah
-            if hp_ratio >= 0.20:
-                return Decision(
-                    kind="attack",
-                    target_agent_id=weakest.get("id"),
-                    reason=f"mengincar agent dengan HP terendah ({weakest.get('hp')} HP) untuk kill",
-                )
-
-    # 3) KABUR KALAU SEKARAT (Diubah jadi lebih berani, kabur kalau HP di bawah 30% saja)
-    if hp_ratio < 0.30:
-        if connections:
-            return Decision(
-                kind="move",
-                target_region_id=random.choice(connections),
-                reason=f"critical HP ({hp_ratio:.0%}) — retreating unconditionally",
-            )
-        else:
-            return Decision(
-                kind="wait",
-                reason=f"critical HP ({hp_ratio:.0%}) but no connections to flee to",
-            )
-
-    # 4) HAJAR MONSTER TERLEMAH KALAU NGANGGUR
-    if hp_ratio >= 0.5 and visible_monsters and ep > 0:
-        weakest_monster = min(visible_monsters, key=lambda m: m.get("hp", 999))
-        return Decision(
-            kind="attack",
-            target_monster_id=weakest_monster.get("id"),
-            reason=f"farming monster lemah (HP: {weakest_monster.get('hp')})",
-        )
-
-    # 5) MENGHINDARI KERUMUNAN (Crowd Control)
-    CROWDED_THRESHOLD = 10
+    # 2) MENGHINDARI KERUMUNAN (Tingkat toleransi diturunkan jadi 5)
+    CROWDED_THRESHOLD = 5
     if len(visible_agents) > CROWDED_THRESHOLD and connections:
         return Decision(
             kind="move",
             target_region_id=random.choice(connections),
             reason=(
-                f"crowded region ({len(visible_agents)} agents) — "
-                "evacuating high risk area"
+                f"keramaian terdeteksi ({len(visible_agents)} agents) — "
+                "terlalu bahaya untuk akun tanpa equip, menghindar!"
             ),
         )
 
-    # 6) TERJEBAK DI GUA
-    if in_cave:
-        return Decision(kind="wait", reason="in cave — awaiting explicit exit handling")
+    # 3) KABUR KALAU HP KURANG DARI 50% (Sangat hati-hati)
+    if hp_ratio < 0.50:
+        if connections:
+            return Decision(
+                kind="move",
+                target_region_id=random.choice(connections),
+                reason=f"HP mulai tipis ({hp_ratio:.0%}) — mundur dari bahaya",
+            )
+        else:
+            return Decision(
+                kind="wait",
+                reason=f"HP tipis ({hp_ratio:.0%}) tapi terjebak (tidak ada jalan)",
+            )
 
-    # 7) EXPLORE RUIN (Looting)
+    # 4) PRIORITAS NGE-LOOT (Mulung Ruin)
     alert_active = self_state.get("alertActive", False)
     alert_gauge = self_state.get("alertGauge", 0) or 0
-    if visible_ruins and not alert_active and alert_gauge <= 4 and hp_ratio >= 0.7:
+    # Berani nge-loot selama HP di atas 60% dan alert masih aman
+    if visible_ruins and not alert_active and alert_gauge <= 4 and hp_ratio >= 0.6:
         ruin = next((r for r in visible_ruins if not r.get("isEmpty")), None)
         if ruin:
             return Decision(
                 kind="explore",
                 ruin_id=ruin.get("ruinId"),
-                reason=f"exploring ruin (alertGauge={alert_gauge}, hp={hp_ratio:.0%})",
+                reason=f"mulung resource di ruin (alertGauge={alert_gauge}, hp={hp_ratio:.0%})",
             )
 
-    # 8) REPOSITION (Jalan-jalan kalau nggak ada target/kerjaan)
+    # 5) NYERANG AGENT HANYA JIKA MEREKA SANGAT SEKARAT (Numpang Nyampah)
+    if hp_ratio >= 0.7 and visible_agents:
+        non_guardian_targets = [a for a in visible_agents if not a.get("isGuardian")]
+        if non_guardian_targets:
+            weakest = min(
+                non_guardian_targets,
+                key=lambda a: a.get("hp", 999),
+            )
+            # Hanya nyerang kalau musuh HP-nya di bawah 30% dari HP bot kita
+            if weakest.get("hp", 999) <= hp * 0.3 and ep > 0:
+                return Decision(
+                    kind="attack",
+                    target_agent_id=weakest.get("id"),
+                    reason=f"mencuri kill dari target sekarat (HP: {weakest.get('hp')})",
+                )
+
+    # 6) MONSTER TERLEMAH SAJA YANG DISERANG
+    if hp_ratio >= 0.7 and visible_monsters and ep > 0:
+        weakest_monster = min(visible_monsters, key=lambda m: m.get("hp", 999))
+        if weakest_monster.get("hp", 999) < 25:
+            return Decision(
+                kind="attack",
+                target_monster_id=weakest_monster.get("id"),
+                reason=f"farming monster lemah (HP: {weakest_monster.get('hp')})",
+            )
+
+    # 7) TERJEBAK DI GUA
+    if in_cave:
+        return Decision(kind="wait", reason="di dalam gua — menunggu interaksi")
+
+    # 8) REPOSITION (Terus berjalan cari ruin baru jika diam)
     if connections:
         return Decision(
             kind="move",
             target_region_id=random.choice(connections),
-            reason="no immediate threat/opportunity — repositioning",
+            reason="berpindah tempat mencari aman atau mencari ruin baru",
         )
 
-    return Decision(kind="wait", reason="no connections and nothing to do")
+    return Decision(kind="wait", reason="tidak ada jalan keluar dan tidak ada target")
 
 
 def build_action_payload(decision: Decision) -> dict:
@@ -709,6 +707,7 @@ async def run_one_game(rest: RestClient, entry_type: str) -> str:
     join_started_at = time.monotonic()
 
     try:
+        # Kita menggunakan additional_headers yang sudah diperbaiki sebelumnya
         async with websockets.connect(
             WS_JOIN_URL, additional_headers=headers, ping_interval=20, ping_timeout=20
         ) as ws:
