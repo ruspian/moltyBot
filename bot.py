@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Claw Royale agent bot. (Ultimate Edition - Hybrid & Smart Memory)
+Claw Royale agent bot. (Ultimate Skynet Edition)
+Features: Hybrid Mode, Graph Mapping (BFS), Dynamic Risk, SL Plus Eject, Smart Target.
 """
 
 from __future__ import annotations
@@ -28,10 +29,8 @@ API_KEY = os.environ.get("CLAW_API_KEY", "").strip()
 BASE_HOST = os.environ.get("CLAW_HOST", "cdn.clawroyale.ai").strip()
 REST_BASE = f"https://{BASE_HOST}/api"
 WS_JOIN_URL = f"wss://{BASE_HOST}/ws/join"
-WS_AGENT_URL = f"wss://{BASE_HOST}/ws/agent"
 
 ENTRY_TYPE_PREFERENCE = os.environ.get("CLAW_ENTRY_TYPE", "auto").strip().lower()
-
 LOG_LEVEL = os.environ.get("CLAW_LOG_LEVEL", "INFO").upper()
 STATE_POLL_INTERVAL = float(os.environ.get("CLAW_STATE_POLL_INTERVAL", "5"))
 RECONNECT_MIN_DELAY = float(os.environ.get("CLAW_RECONNECT_MIN_DELAY", "1"))
@@ -158,14 +157,10 @@ class RestClient:
         )
 
 
-# --------------------------------------------------------------------------
-# Loadout setup
-# --------------------------------------------------------------------------
-
 async def ensure_loadout(rest: RestClient) -> None:
     try:
         loadout = (await rest.get_loadout()).get("data", {})
-    except ApiError as e:
+    except ApiError:
         return
 
     if loadout.get("fullSet"):
@@ -174,7 +169,7 @@ async def ensure_loadout(rest: RestClient) -> None:
     try:
         packs = await rest.get_inventory_packs()
         relics = await rest.get_inventory_relics()
-    except ApiError as e:
+    except ApiError:
         return
 
     active_pack = loadout.get("activePack")
@@ -205,7 +200,7 @@ async def ensure_loadout(rest: RestClient) -> None:
 
 
 # --------------------------------------------------------------------------
-# Data Structures
+# Data Structures & BFS Pathfinding
 # --------------------------------------------------------------------------
 
 @dataclass
@@ -232,24 +227,50 @@ class GameSession:
     confirmed_dead_targets: set = field(default_factory=set)
     last_seen_target_hp: dict = field(default_factory=dict)  
     last_equipment_signature: Optional[str] = None
-    visited_regions: list = field(default_factory=list) # Memory system
+    
+    # Advanced Memory (Graph Mapping)
+    graph: dict = field(default_factory=dict)
+    unexplored_regions: set = field(default_factory=set)
+    visited_regions: list = field(default_factory=list)
 
+
+def bfs_find_path(start: str, targets: set, graph: dict) -> Optional[str]:
+    """Mencari rute terdekat menuju area yang belum terjamah."""
+    if not targets or start not in graph:
+        return None
+    
+    queue = [(start, [])]
+    visited = {start}
+    
+    while queue:
+        curr, path = queue.pop(0)
+        if curr in targets and path:
+            return path[0]  # Kembalikan langkah pertama
+        
+        for neighbor in graph.get(curr, []):
+            if neighbor not in visited:
+                visited.add(neighbor)
+                queue.append((neighbor, path + [neighbor]))
+    return None
+
+def smart_move(connections: list, session: GameSession, current_region: str) -> str:
+    """Menggunakan BFS untuk ke ruang baru, atau fallback ke smart-random."""
+    best_step = bfs_find_path(current_region, session.unexplored_regions, session.graph)
+    if best_step and best_step in connections:
+        return best_step
+    
+    unvisited = [c for c in connections if c not in session.visited_regions]
+    if unvisited:
+        return random.choice(unvisited)
+    return random.choice(connections)
 
 def is_cooldown_action(kind: str) -> bool:
     return kind in {"move", "attack", "explore"}
 
 
 # --------------------------------------------------------------------------
-# Decision logic (ULTIMATE: HYBRID + MEMORY + HEAL)
+# Decision logic (ULTIMATE SKYNET EDITION)
 # --------------------------------------------------------------------------
-
-def pick_smart_move(connections: list, visited: list) -> str:
-    """Memory Tweak: Prioritaskan pindah ke region yang belum dikunjungi."""
-    unvisited = [c for c in connections if c not in visited]
-    if unvisited:
-        return random.choice(unvisited)
-    return random.choice(connections)
-
 
 def decide(view: dict, session: GameSession) -> Decision:
     self_state = view.get("self", {}) or {}
@@ -257,143 +278,131 @@ def decide(view: dict, session: GameSession) -> Decision:
     max_hp_guess = self_state.get("maxHp", 100) or 100
     ep = self_state.get("ep", 0)
     in_cave = self_state.get("inCave", False)
+    
     current_region = view.get("currentRegion", {}) or {}
+    curr_region_id = current_region.get("id")
     is_death_zone = current_region.get("isDeathZone", False)
     connections = current_region.get("connections") or []
+    pending_deathzones = view.get("pendingDeathzones") or []
+    
     visible_agents = view.get("visibleAgents") or []
     visible_monsters = view.get("visibleMonsters") or []
     visible_ruins = view.get("visibleRuins") or []
-    pending_deathzones = view.get("pendingDeathzones") or []
     inventory = self_state.get("inventory") or []
 
     hp_ratio = hp / max_hp_guess if max_hp_guess else 1.0
     has_weapon = self_state.get("equippedWeapon") is not None
 
-    # 1) PRIORITAS MUTLAK: KABUR DARI DEATH ZONE
+    # Kalkulasi HP Drop (SL Plus Algorithm)
+    prev_hp = (session.last_view.get("self") or {}).get("hp") if session.last_view else hp
+    hp_drop = prev_hp - hp if prev_hp is not None else 0
+
+    # 1) PRIORITAS MUTLAK 1: KABUR DARI DEATH ZONE
     pending_here_ids = {dz.get("id") for dz in pending_deathzones}
-    if is_death_zone or current_region.get("id") in pending_here_ids:
-        safe_targets = [c for c in connections]
-        if safe_targets:
+    if is_death_zone or curr_region_id in pending_here_ids:
+        if connections:
             return Decision(
                 kind="move",
-                target_region_id=pick_smart_move(safe_targets, session.visited_regions),
+                target_region_id=smart_move(connections, session, curr_region_id),
                 reason="[URGENT] Evakuasi dari Death Zone mutlak!",
             )
 
-    # 2) AUTO-HEAL TWEAK (Gunakan item pemulih jika HP bocor)
+    # 2) PRIORITAS MUTLAK 2: EMERGENCY EJECT (SL PLUS)
+    if hp_drop >= 25:
+        if connections:
+            return Decision(
+                kind="move",
+                target_region_id=smart_move(connections, session, curr_region_id),
+                reason=f"[SL PLUS] Damage spike terdeteksi! Hilang {hp_drop} HP, Emergency Eject!",
+            )
+
+    # 3) DYNAMIC RISK SCORING
+    risk_score = 0
+    guardian_present = False
+    for a in visible_agents:
+        if a.get("isGuardian"):
+            risk_score += 50
+            guardian_present = True
+        elif a.get("hp", 100) < 30:
+            risk_score -= 10  # Prasmanan kill, turunkan risiko
+        else:
+            risk_score += 15
+            
+    alert_gauge = self_state.get("alertGauge", 0) or 0
+    risk_score += (alert_gauge * 5)
+    
+    # 4) AUTO-HEAL
     recovery_items = [i for i in inventory if i.get("category") == "recovery"]
     if hp_ratio <= 0.60 and recovery_items:
         item_to_use = recovery_items[0]
-        # Pastikan tidak looping (nyangkut) di item yang sama jika server nge-bug
         if item_to_use.get("id") != session.last_action_target or session.consecutive_same_target < 2:
             return Decision(
                 kind="equip", 
                 item_id=item_to_use.get("id"),
-                reason=f"[AUTO-HEAL] Mengkonsumsi {item_to_use.get('name')} (HP sisa: {hp_ratio:.0%})"
+                reason=f"[AUTO-HEAL] Konsumsi {item_to_use.get('name')} (Sisa HP: {hp_ratio:.0%})"
             )
 
     # ==========================================
-    # LOGIKA JIKA BAWA SENJATA (MODE BARBAR)
+    # HYBRID LOGIC & SMART TARGET SELECTION
     # ==========================================
-    if has_weapon:
-        # Hajar Musuh Paling Lemah (Prioritas Cari Kill)
-        if visible_agents and ep > 0:
-            non_guardian_targets = [a for a in visible_agents if not a.get("isGuardian")]
-            if non_guardian_targets:
-                weakest = min(non_guardian_targets, key=lambda a: a.get("hp", 999))
-                # Sikat selama HP bot tidak sekarat (>30%)
-                if hp_ratio >= 0.30:
-                    return Decision(
-                        kind="attack",
-                        target_agent_id=weakest.get("id"),
-                        reason=f"[MODE BARBAR] Eksekusi agen! (Target HP: {weakest.get('hp')})",
-                    )
+    
+    # Evaluasi Resiko Ekstrim
+    # Jika tangan kosong, toleransi risk = 15. Jika bawa senjata, toleransi risk = 40.
+    max_risk_tolerance = 40 if has_weapon else 15
+    if risk_score > max_risk_tolerance and hp_ratio < 0.90:
+        if connections:
+            return Decision(
+                kind="move",
+                target_region_id=smart_move(connections, session, curr_region_id),
+                reason=f"[RISK SCORING] Bahaya ekstrim (Skor: {risk_score}), mundur cari posisi!"
+            )
+
+    # Memilah Target (Smart Target Selection)
+    non_guardian_targets = [a for a in visible_agents if not a.get("isGuardian")]
+    if non_guardian_targets and ep > 0:
+        weakest = min(non_guardian_targets, key=lambda a: a.get("hp", 999))
+        weakest_hp = weakest.get("hp", 999)
         
-        # Kabur kalau sekarat mutlak (< 30%)
-        if hp_ratio < 0.30:
-            if connections:
-                return Decision(
-                    kind="move",
-                    target_region_id=pick_smart_move(connections, session.visited_regions),
-                    reason=f"[MODE BARBAR] HP Kritis ({hp_ratio:.0%}) - Mundur taktis!",
-                )
-            else:
-                return Decision(kind="wait", reason="HP Kritis tapi buntu")
-        
-        # Farming Monster Santai
-        if hp_ratio >= 0.5 and visible_monsters and ep > 0:
-            weakest_monster = min(visible_monsters, key=lambda m: m.get("hp", 999))
+        # SMART WAIT: Biarkan Guardian yang eksekusi
+        if guardian_present and weakest_hp < 40:
+            return Decision(
+                kind="wait",
+                reason=f"[SMART TARGET] Menunggu Guardian membunuh target lemah ({weakest_hp} HP)"
+            )
+
+        # Serang jika syarat terpenuhi
+        if has_weapon and hp_ratio >= 0.30:
+            return Decision(
+                kind="attack",
+                target_agent_id=weakest.get("id"),
+                reason=f"[MODE BARBAR] Eksekusi agen! (Target HP: {weakest_hp})",
+            )
+        elif not has_weapon and weakest_hp <= hp * 0.3:
+            return Decision(
+                kind="attack",
+                target_agent_id=weakest.get("id"),
+                reason=f"[MODE PEMULUNG] Nyampah agen sekarat (Target HP: {weakest_hp})",
+            )
+
+    # Serang Monster (Priority Low)
+    if visible_monsters and ep > 0:
+        weakest_monster = min(visible_monsters, key=lambda m: m.get("hp", 999))
+        mon_hp = weakest_monster.get("hp", 999)
+        if has_weapon and hp_ratio >= 0.5:
             return Decision(
                 kind="attack",
                 target_monster_id=weakest_monster.get("id"),
-                reason=f"[MODE BARBAR] Farming monster (HP: {weakest_monster.get('hp')})",
+                reason=f"[MODE BARBAR] Farming monster (HP: {mon_hp})",
             )
-
-        # Hindari Kerumunan Terlalu Ekstrem (> 8 orang)
-        CROWDED_THRESHOLD = 8
-        if len(visible_agents) > CROWDED_THRESHOLD and connections:
+        elif not has_weapon and mon_hp < 25:
             return Decision(
-                kind="move",
-                target_region_id=pick_smart_move(connections, session.visited_regions),
-                reason=f"[MODE BARBAR] Terlalu ramai ({len(visible_agents)} orang), repo posisi",
+                kind="attack",
+                target_monster_id=weakest_monster.get("id"),
+                reason=f"[MODE PEMULUNG] Gebuk monster lemah (HP: {mon_hp})",
             )
 
-    # ==========================================
-    # LOGIKA JIKA TANGAN KOSONG (MODE PEMULUNG)
-    # ==========================================
-    else:
-        # Sangat Paranoid (Toleransi Kerumunan: 2 orang)
-        if visible_agents:
-            if hp_ratio < 0.90 or len(visible_agents) >= 2:
-                if connections:
-                    return Decision(
-                        kind="move",
-                        target_region_id=pick_smart_move(connections, session.visited_regions),
-                        reason=f"[MODE PEMULUNG] Menghindar! (HP: {hp_ratio:.0%} / Musuh: {len(visible_agents)})",
-                    )
-                else:
-                    return Decision(kind="wait", reason="Terkepung tanpa senjata!")
-
-        # Kabur mutlak jika HP bocor (<30%)
-        if hp_ratio < 0.30:
-            if connections:
-                return Decision(
-                    kind="move",
-                    target_region_id=pick_smart_move(connections, session.visited_regions),
-                    reason=f"[MODE PEMULUNG] HP Kritis ({hp_ratio:.0%}) - Lari cari aman",
-                )
-            else:
-                return Decision(kind="wait", reason="Sekarat dan buntu")
-
-        # Numpang Nyampah Kill Agen
-        if visible_agents:
-            non_guardian_targets = [a for a in visible_agents if not a.get("isGuardian")]
-            if non_guardian_targets:
-                weakest = min(non_guardian_targets, key=lambda a: a.get("hp", 999))
-                if weakest.get("hp", 999) <= hp * 0.3 and ep > 0:
-                    return Decision(
-                        kind="attack",
-                        target_agent_id=weakest.get("id"),
-                        reason=f"[MODE PEMULUNG] Nyampah target sekarat (HP musuh: {weakest.get('hp')})",
-                    )
-        
-        # Numpang Nyampah Monster Sangat Lemah
-        if visible_monsters and ep > 0:
-            weakest_monster = min(visible_monsters, key=lambda m: m.get("hp", 999))
-            if weakest_monster.get("hp", 999) < 25:
-                return Decision(
-                    kind="attack",
-                    target_monster_id=weakest_monster.get("id"),
-                    reason=f"[MODE PEMULUNG] Gebuk monster lemah (HP: {weakest_monster.get('hp')})",
-                )
-
-    # ==========================================
-    # LOGIKA UMUM (Nge-loot, Reposisi, dsb)
-    # ==========================================
-    
-    # Eksplorasi Ruin (Hanya Jika Aman)
+    # Eksplorasi Ruin (Nge-loot)
     alert_active = self_state.get("alertActive", False)
-    alert_gauge = self_state.get("alertGauge", 0) or 0
     if visible_ruins and not alert_active and alert_gauge <= 4:
         ruin = next((r for r in visible_ruins if not r.get("isEmpty")), None)
         if ruin:
@@ -403,36 +412,30 @@ def decide(view: dict, session: GameSession) -> Decision:
                 reason=f"Membongkar ruin (alert={alert_gauge}, hp={hp_ratio:.0%})",
             )
 
-    # Terjebak di Gua
     if in_cave:
         return Decision(kind="wait", reason="Di dalam gua — menunggu interaksi")
 
-    # Jalan-jalan Cari Ruin / Musuh menggunakan Smart Memory
     if connections:
         return Decision(
             kind="move",
-            target_region_id=pick_smart_move(connections, session.visited_regions),
-            reason="Repositioning — Menyisir area baru",
+            target_region_id=smart_move(connections, session, curr_region_id),
+            reason="Repositioning — BFS Pathfinding ke area baru",
         )
 
-    return Decision(kind="wait", reason="Tidak ada jalan keluar")
+    return Decision(kind="wait", reason="Buntu, tidak ada yang bisa dilakukan")
 
 
 def build_action_payload(decision: Decision) -> dict:
     payload: dict[str, Any] = {"type": "action", "action": decision.kind}
-
     if decision.kind == "move" and decision.target_region_id:
         payload["targetRegionId"] = decision.target_region_id
     elif decision.kind == "attack":
-        if decision.target_agent_id:
-            payload["targetAgentId"] = decision.target_agent_id
-        elif decision.target_monster_id:
-            payload["targetMonsterId"] = decision.target_monster_id
+        if decision.target_agent_id: payload["targetAgentId"] = decision.target_agent_id
+        elif decision.target_monster_id: payload["targetMonsterId"] = decision.target_monster_id
     elif decision.kind == "explore" and decision.ruin_id:
         payload["ruinId"] = decision.ruin_id
     elif decision.kind == "equip" and decision.item_id:
         payload["itemId"] = decision.item_id
-
     return payload
 
 
@@ -458,11 +461,11 @@ async def play_session(ws, session: GameSession) -> str:
         if ftype == "welcome":
             decision = frame.get("decision")
             if decision == "BLOCKED":
-                log.error("join blocked by server: %s", frame)
+                log.error("join blocked by server")
                 return "closed"
 
         elif ftype in ("waiting", "queued"):
-            log.info("%s: %s", ftype, json.dumps(frame)[:300])
+            pass # Keep it clean
 
         elif ftype == "assigned":
             session.game_id = frame.get("gameId")
@@ -480,19 +483,27 @@ async def play_session(ws, session: GameSession) -> str:
             session.last_view = view
             session.last_view_turn = frame.get("turn")
             
-            # --- UPDATE SMART MEMORY ---
+            # --- GRAPH UPDATE (MEMORY) ---
             current_region = view.get("currentRegion", {}) or {}
             curr_reg_id = current_region.get("id")
+            connections = current_region.get("connections", [])
+            
             if curr_reg_id:
+                session.graph[curr_reg_id] = connections
+                for c in connections:
+                    if c not in session.graph:
+                        session.unexplored_regions.add(c)
+                if curr_reg_id in session.unexplored_regions:
+                    session.unexplored_regions.remove(curr_reg_id)
+
                 if not session.visited_regions or session.visited_regions[-1] != curr_reg_id:
                     session.visited_regions.append(curr_reg_id)
                     if len(session.visited_regions) > 5:
-                        session.visited_regions.pop(0) # Simpan max 5 history
+                        session.visited_regions.pop(0) 
 
             visible_agents = view.get("visibleAgents") or []
             visible_monsters = view.get("visibleMonsters") or []
             visible_ruins = view.get("visibleRuins") or []
-
             hp_display = f"{new_hp}/{new_max_hp}" if new_max_hp else str(new_hp)
 
             log_info_block("Status", {
@@ -529,20 +540,6 @@ async def play_session(ws, session: GameSession) -> str:
                     **(item_lines or {"item": "(kosong)"}),
                 })
             
-            # --- WARNING HP DROP ---
-            if (
-                prev_hp is not None
-                and new_hp is not None
-                and new_hp < prev_hp
-                and session.last_decision_kind not in ["attack", "equip"]
-            ):
-                log_info_block("⚠️ TERJADI DAMAGE MISTERIUS!", {
-                    "hp awal": prev_hp,
-                    "hp sisa": new_hp,
-                    "darah hilang": prev_hp - new_hp,
-                    "aksi terakhir": session.last_decision_kind,
-                    "penyebab": "Terkena hit saat cooldown, Cuaca, Guardian, atau Efek Status."
-                })
             await maybe_act(ws, session, view)
 
         elif ftype == "action_rejected":
@@ -560,7 +557,7 @@ async def play_session(ws, session: GameSession) -> str:
             error = frame.get("error") or {}
             
             if session.last_decision_kind == "explore" and success:
-                log.info("💎 [SUKSES EKSPLORASI] Berhasil membongkar ruin! Cek log game untuk detail item.")
+                log.info("💎 [SUKSES EKSPLORASI] Berhasil membongkar ruin! Cek log game untuk item.")
             elif session.last_decision_kind == "equip" and success:
                 log.info("🟢 [SUKSES HEALING] Item berhasil digunakan!")
             elif not success:
@@ -601,122 +598,50 @@ async def play_session(ws, session: GameSession) -> str:
     return "closed"
 
 
-def get_target_current_hp(view: dict, target_id: str) -> Optional[int]:
-    for a in (view.get("visibleAgents") or []):
-        if a.get("id") == target_id:
-            return a.get("hp")
-    for m in (view.get("visibleMonsters") or []):
-        if m.get("id") == target_id:
-            return m.get("hp")
-    return None
-
-
 async def maybe_act(ws, session: GameSession, view: dict) -> None:
-    if not view:
-        return
-
+    if not view: return
     self_state = view.get("self", {}) or {}
-    if self_state.get("isAlive") is False:
-        return
-
-    if not session.can_act:
-        return
+    if self_state.get("isAlive") is False: return
+    if not session.can_act: return
 
     decision = decide(view, session)
-
     current_target = (
         decision.ruin_id or decision.target_monster_id or decision.target_agent_id or decision.item_id
     )
 
-    if decision.kind in ["attack", "equip"] and current_target:
-        target_confirmed_dead = current_target in session.confirmed_dead_targets
-        current_target_hp = get_target_current_hp(view, current_target)
-        previously_seen_hp = session.last_seen_target_hp.get(current_target)
-        
-        is_same_target_as_last_attack = (
-            current_target == session.last_action_target
-            and session.last_decision_kind == decision.kind
-        )
-        no_damage_landed = (
-            decision.kind == "attack"
-            and is_same_target_as_last_attack
-            and previously_seen_hp is not None
-            and current_target_hp is not None
-            and current_target_hp == previously_seen_hp
-        )
-        target_healing = (
-            decision.kind == "attack"
-            and is_same_target_as_last_attack
-            and previously_seen_hp is not None
-            and current_target_hp is not None
-            and current_target_hp > previously_seen_hp
-        )
-        
-        # Tambahan proteksi jika Heal loop/gagal
-        is_failed_heal = (decision.kind == "equip" and session.consecutive_same_target >= 2)
-
-        if target_confirmed_dead or no_damage_landed or target_healing or is_failed_heal:
-            log_info_block("⚠️ AKSI DIBATALKAN (PROTEKSI STUCK)", {
-                "target id": current_target,
-                "alasan": "Serangan kebal/heal nyangkut",
-                "tindakan": "Batal dan reposisi area"
-            })
-            connections = (view.get("currentRegion") or {}).get("connections") or []
-            if connections:
-                decision = Decision(
-                    kind="move",
-                    target_region_id=pick_smart_move(connections, session.visited_regions),
-                    reason="Membatalkan aksi macet, repo posisi",
-                )
-                current_target = None
-            else:
-                decision = Decision(kind="wait", reason="Aksi dibatalkan tapi buntu")
-                current_target = None
-        else:
-            if current_target_hp is not None:
-                session.last_seen_target_hp[current_target] = current_target_hp
-            session.last_action_target = current_target
-
-    elif decision.kind == "explore" and current_target:
-        if (
-            current_target == session.last_action_target
-            and session.last_decision_kind == "explore"
-        ):
+    if decision.kind in ["attack", "equip", "explore"] and current_target:
+        if current_target == session.last_action_target and session.last_decision_kind == decision.kind:
             session.consecutive_same_target += 1
         else:
             session.consecutive_same_target = 0
 
-        if session.consecutive_same_target >= 1:
-            log_info_block("⚠️ RUIN NYANGKUT ATAU HABIS", {
-                "tindakan": "Menghindari loop eksploitasi, otomatis pindah area."
+        # Proteksi Anti-Stuck (Maks 2x coba)
+        if session.consecutive_same_target >= 2:
+            log_info_block("⚠️ AKSI DIBATALKAN (PROTEKSI STUCK)", {
+                "tindakan": "Mencegah spam ke target/ruin yang sama, repo posisi."
             })
             connections = (view.get("currentRegion") or {}).get("connections") or []
             if connections:
                 decision = Decision(
                     kind="move",
-                    target_region_id=pick_smart_move(connections, session.visited_regions),
-                    reason="Meninggalkan ruin rusak, repo posisi",
+                    target_region_id=smart_move(connections, session, view.get("currentRegion", {}).get("id")),
+                    reason="Membatalkan aksi macet, repo posisi via BFS",
                 )
+                current_target = None
             else:
-                decision = Decision(kind="wait", reason="Ruin buntu")
-            session.consecutive_same_target = 0
-            session.last_action_target = None
+                decision = Decision(kind="wait", reason="Aksi macet tapi buntu")
+                current_target = None
         else:
             session.last_action_target = current_target
     else:
         session.consecutive_same_target = 0
 
     session.last_decision_kind = decision.kind
-
     payload = build_action_payload(decision)
     
-    # Ambil display untuk di log
     target_display = (
-        decision.target_region_id
-        or decision.target_agent_id
-        or decision.target_monster_id
-        or decision.ruin_id
-        or decision.item_id
+        decision.target_region_id or decision.target_agent_id or 
+        decision.target_monster_id or decision.ruin_id or decision.item_id
     )
     
     log_info_block("Aksi", {
@@ -784,12 +709,10 @@ async def choose_entry_type(rest: RestClient) -> Optional[str]:
     paid_live = live("paid")
 
     if ENTRY_TYPE_PREFERENCE == "paid":
-        if paid_live or readiness.get("paidReady"):
-            return "paid"
+        if paid_live or readiness.get("paidReady"): return "paid"
         return "free"
-    if ENTRY_TYPE_PREFERENCE == "free":
-        return "free"
-
+    if ENTRY_TYPE_PREFERENCE == "free": return "free"
+    
     if paid_live: return "paid"
     if free_live: return "free"
     if readiness.get("paidReady"): return "paid"
@@ -798,7 +721,7 @@ async def choose_entry_type(rest: RestClient) -> Optional[str]:
 
 async def main_loop() -> None:
     if not API_KEY:
-        log.error("CLAW_API_KEY is not set — see .env.example")
+        log.error("CLAW_API_KEY is not set")
         sys.exit(1)
 
     stop = asyncio.Event()
