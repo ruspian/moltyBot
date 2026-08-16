@@ -714,9 +714,17 @@ async def play_session(ws, session: GameSession) -> str:
 
             error = frame.get("error") or {}
             if not success:
+                # last_action_target only tracks attack/explore targets -
+                # for a failed move, show the move's actual target region
+                # instead of a stale attack target id.
+                failed_target = (
+                    session.last_move_target_region
+                    if session.last_decision_kind == "move"
+                    else session.last_action_target
+                )
                 log_info_block("⚠️ AKSI GAGAL (action_result)", {
                     "action yang dikirim": session.last_decision_kind,
-                    "target": session.last_action_target,
+                    "target": failed_target,
                     "error code": error.get("code"),
                     "error message": error.get("message"),
                     "canAct": can_act,
@@ -724,6 +732,24 @@ async def play_session(ws, session: GameSession) -> str:
 
             if error.get("code") == "TARGET_DEAD" and session.last_action_target:
                 session.confirmed_dead_targets.add(session.last_action_target)
+
+            # An explicit rejection (e.g. COOLDOWN_ACTIVE right after a
+            # TARGET_DEAD redirect, when our client-side can_act tracking
+            # was briefly ahead of the server's real cooldown state)
+            # already explains exactly why this move failed. Don't also
+            # let the generic silent-move diagnostic below pile a
+            # "N consecutive failures" warning on top of an
+            # already-understood, unrelated failure mode - that
+            # diagnostic exists specifically to catch moves the server
+            # reports as successful but silently doesn't apply.
+            if (
+                not success
+                and session.last_decision_kind == "move"
+                and session.last_move_target_region is not None
+            ):
+                session.consecutive_failed_moves = 0
+                session.last_move_target_region = None
+                session.region_before_last_move = None
 
             inline_view = frame.get("view")
             if inline_view:
