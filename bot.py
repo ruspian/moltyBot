@@ -709,9 +709,8 @@ async def run_one_game(rest: RestClient, entry_type: str) -> str:
     join_started_at = time.monotonic()
 
     try:
-        # PERBAIKAN: websockets menggunakan extra_headers
         async with websockets.connect(
-            WS_JOIN_URL, extra_headers=headers, ping_interval=20, ping_timeout=20
+            WS_JOIN_URL, additional_headers=headers, ping_interval=20, ping_timeout=20
         ) as ws:
             welcome_raw = await ws.recv()
             welcome = json.loads(welcome_raw)
