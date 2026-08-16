@@ -242,7 +242,7 @@ async def ensure_loadout(rest: RestClient) -> None:
 
 
 # --------------------------------------------------------------------------
-# Decision logic (MODE PEMULUNG SUPER PARANOID)
+# Decision logic (MODE PEMULUNG PARANOID CERDAS)
 # --------------------------------------------------------------------------
 
 @dataclass
@@ -260,8 +260,6 @@ def is_cooldown_action(kind: str) -> bool:
 
 
 def decide(view: dict) -> Decision:
-    """Mode: Scavenger/Pemulung Paranoid. Fokus loot, jauhi siapapun, bertahan hidup."""
-
     self_state = view.get("self", {}) or {}
     hp = self_state.get("hp", 100)
     max_hp_guess = self_state.get("maxHp", 100) or 100
@@ -288,61 +286,52 @@ def decide(view: dict) -> Decision:
                 reason="evakuasi dari death zone mutlak",
             )
 
-    # 2) MENGHINDARI PLAYER LAIN (Sangat Paranoid / Anti-Sosial)
-    # Kalau ada 2 orang atau lebih di satu area, LANGSUNG KABUR!
-    CROWDED_THRESHOLD = 1
-    if len(visible_agents) > CROWDED_THRESHOLD and connections:
-        return Decision(
-            kind="move",
-            target_region_id=random.choice(connections),
-            reason=(
-                f"ada player lain ({len(visible_agents)} agents) — "
-                "terlalu bahaya untuk akun tanpa equip, langsung kabur!"
-            ),
-        )
+    # 2) MENGHINDARI PLAYER LAIN DENGAN CERDAS
+    if visible_agents:
+        # Jika HP bocor (<90%) ATAU ada 2 musuh lebih, langsung ngacir!
+        if hp_ratio < 0.90 or len(visible_agents) >= 2:
+            if connections:
+                return Decision(
+                    kind="move",
+                    target_region_id=random.choice(connections),
+                    reason=f"menghindar! (HP: {hp_ratio:.0%} / Musuh: {len(visible_agents)})",
+                )
+            else:
+                return Decision(kind="wait", reason="terkepung dan tidak ada jalan keluar")
 
-    # 3) KABUR KALAU KENA HIT (HP di bawah 90%)
-    # Jangan tunggu HP 50%. Kesenggol dikit langsung lari!
-    if hp_ratio < 0.90:
+    # 3) KABUR MUTLAK KETIKA HP KRITIS (<30%) MESKI RUANGAN KOSONG
+    if hp_ratio < 0.30:
         if connections:
             return Decision(
                 kind="move",
                 target_region_id=random.choice(connections),
-                reason=f"HP berkurang ({hp_ratio:.0%}) — mundur mencari aman!",
+                reason=f"HP sangat kritis ({hp_ratio:.0%}) — lari cari aman mutlak",
             )
         else:
-            return Decision(
-                kind="wait",
-                reason=f"HP kritis ({hp_ratio:.0%}) tapi tidak ada jalan kabur",
-            )
+            return Decision(kind="wait", reason="Sekarat tapi buntu")
 
-    # 4) PRIORITAS NGE-LOOT (Mulung Ruin)
+    # 4) PRIORITAS NGE-LOOT (Mulai berani eksplorasi jika ruangan aman)
     alert_active = self_state.get("alertActive", False)
     alert_gauge = self_state.get("alertGauge", 0) or 0
-    # Berani nge-loot selama HP aman dan alert gauge rendah
     if visible_ruins and not alert_active and alert_gauge <= 4:
         ruin = next((r for r in visible_ruins if not r.get("isEmpty")), None)
         if ruin:
             return Decision(
                 kind="explore",
                 ruin_id=ruin.get("ruinId"),
-                reason=f"mulung resource di ruin (alertGauge={alert_gauge}, hp={hp_ratio:.0%})",
+                reason=f"mulung resource di ruin (alert={alert_gauge}, hp={hp_ratio:.0%})",
             )
 
-    # 5) NYERANG AGENT HANYA JIKA MEREKA SANGAT SEKARAT (Numpang Nyampah)
+    # 5) NYERANG AGENT HANYA JIKA MEREKA SANGAT SEKARAT
     if visible_agents:
         non_guardian_targets = [a for a in visible_agents if not a.get("isGuardian")]
         if non_guardian_targets:
-            weakest = min(
-                non_guardian_targets,
-                key=lambda a: a.get("hp", 999),
-            )
-            # Hanya nyerang kalau musuh HP-nya di bawah 30% dari HP bot kita
+            weakest = min(non_guardian_targets, key=lambda a: a.get("hp", 999))
             if weakest.get("hp", 999) <= hp * 0.3 and ep > 0:
                 return Decision(
                     kind="attack",
                     target_agent_id=weakest.get("id"),
-                    reason=f"mencuri kill dari target sekarat (HP: {weakest.get('hp')})",
+                    reason=f"mencuri kill dari target sekarat (HP musuh: {weakest.get('hp')})",
                 )
 
     # 6) MONSTER TERLEMAH SAJA YANG DISERANG
@@ -359,15 +348,15 @@ def decide(view: dict) -> Decision:
     if in_cave:
         return Decision(kind="wait", reason="di dalam gua — menunggu interaksi")
 
-    # 8) REPOSITION (Terus berjalan cari ruin baru jika diam)
+    # 8) REPOSITION (Cari ruin baru jika diam)
     if connections:
         return Decision(
             kind="move",
             target_region_id=random.choice(connections),
-            reason="berpindah tempat mencari aman atau mencari ruin baru",
+            reason="berpindah tempat mencari ruang kosong yang ada ruin",
         )
 
-    return Decision(kind="wait", reason="tidak ada jalan keluar dan tidak ada target")
+    return Decision(kind="wait", reason="tidak ada jalan keluar")
 
 
 def build_action_payload(decision: Decision) -> dict:
@@ -417,7 +406,6 @@ async def play_session(ws, session: GameSession) -> str:
         try:
             frame = json.loads(raw)
         except json.JSONDecodeError:
-            log.warning("non-JSON frame: %r", raw[:200])
             continue
 
         ftype = frame.get("type")
@@ -425,7 +413,6 @@ async def play_session(ws, session: GameSession) -> str:
 
         if ftype == "welcome":
             decision = frame.get("decision")
-            log.info("welcome decision=%s", decision)
             if decision == "BLOCKED":
                 log.error("join blocked by server: %s", frame)
                 return "closed"
@@ -487,34 +474,31 @@ async def play_session(ws, session: GameSession) -> str:
                     equipped_weapon.get("name") if isinstance(equipped_weapon, dict)
                     else equipped_weapon
                 )
-                log_info_block("Equipment", {
+                log_info_block("Equipment / Inventory", {
                     "weapon": weapon_name or "(kosong)",
                     **(item_lines or {"item": "(kosong)"}),
                 })
             
+            # --- PERBAIKAN LOG WARNING HP DROP ---
             if (
                 prev_hp is not None
                 and new_hp is not None
                 and new_hp < prev_hp
                 and session.last_decision_kind != "attack"
             ):
-                log.warning(
-                    "HP dropped %s -> %s on a non-attack turn (last action=%s) "
-                    "— raw self=%s region=%s",
-                    prev_hp, new_hp, session.last_decision_kind,
-                    json.dumps(new_self)[:400],
-                    json.dumps(view.get("currentRegion", {}))[:300],
-                )
+                log_info_block("⚠️ TERJADI DEMAGE MISTERIUS!", {
+                    "hp awal": prev_hp,
+                    "hp sisa": new_hp,
+                    "darah hilang": prev_hp - new_hp,
+                    "aksi terakhir": session.last_decision_kind,
+                    "penyebab": "Kemungkinan tersenggol Death Zone, Cuaca, Guardian, atau Efek Status."
+                })
             await maybe_act(ws, session, view)
 
         elif ftype == "action_rejected":
             view = frame.get("view", {})
             session.last_view = view
             session.last_view_turn = frame.get("turn")
-            log.info(
-                "action_rejected — refreshed state turn=%s hp=%s",
-                session.last_view_turn, (view.get("self") or {}).get("hp"),
-            )
             await maybe_act(ws, session, view)
 
         elif ftype == "action_result":
@@ -522,19 +506,17 @@ async def play_session(ws, session: GameSession) -> str:
             can_act = frame.get("canAct")
             if can_act is not None:
                 session.can_act = can_act
-            cooldown_ms = frame.get("cooldownRemainingMs")
+            
             error = frame.get("error") or {}
-            log.info(
-                "action_result success=%s canAct=%s cooldownRemainingMs=%s error=%s",
-                success, can_act, cooldown_ms, error,
-            )
+            
+            # --- PERBAIKAN LOG NOTIFIKASI LOOT ---
+            if session.last_decision_kind == "explore" and success:
+                log.info("💎 [SUKSES EKSPLORASI] Berhasil membongkar ruin! Cek log atau inventory di turn selanjutnya.")
+            elif not success:
+                log.warning(f"❌ [AKSI GAGAL] Sistem menolak aksi: {error.get('code')} - {error.get('message')}")
             
             if error.get("code") == "TARGET_DEAD" and session.last_action_target:
                 session.confirmed_dead_targets.add(session.last_action_target)
-                log.info(
-                    "target=%s confirmed dead via TARGET_DEAD",
-                    session.last_action_target,
-                )
             
             inline_view = frame.get("view")
             if inline_view:
@@ -543,31 +525,28 @@ async def play_session(ws, session: GameSession) -> str:
 
         elif ftype == "can_act_changed":
             session.can_act = frame.get("canAct", True)
-            log.info("can_act_changed -> %s", session.can_act)
             if session.can_act and session.last_view:
                 await maybe_act(ws, session, session.last_view)
+
+        # --- TANGKAP LOG DARI SERVER TENTANG ITEM ---
+        elif ftype == "log":
+            msg = frame.get("message")
+            if msg:
+                log.info(f"📢 INFO GAME: {msg}")
 
         elif ftype == "agent_died":
             meta = frame.get("meta", {}) or {}
             if meta.get("youDied"):
-                log.info(
-                    "we died — survivalTime=%s kills=%s",
-                    frame.get("survivalTime"), frame.get("kills"),
-                )
+                log_info_block("💀 AGEN TEWAS", {
+                    "waktu bertahan": frame.get("survivalTime"),
+                    "total kill": frame.get("kills")
+                })
                 session.alive = False
                 return "died"
-            else:
-                log.debug("another agent died (not us)")
 
         elif ftype == "game_ended":
-            log.info("game_ended: %s", json.dumps(frame)[:800])
+            log.info("🏁 GAME SELESAI.")
             return "ended"
-
-        elif ftype == "log":
-            log.debug("game log: %s", frame.get("message"))
-
-        else:
-            log.debug("unhandled frame type=%s", ftype)
 
     return "closed"
 
@@ -593,7 +572,6 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
     hp = self_state.get("hp")
 
     if not session.can_act:
-        log.debug("canAct is false — waiting for can_act_changed before acting")
         return
 
     decision = decide(view)
@@ -623,14 +601,13 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
             and current_target_hp > previously_seen_hp
         )
 
+        # --- PERBAIKAN LOG WARNING SERANGAN GAGAL ---
         if target_confirmed_dead or no_damage_landed or target_healing:
-            log.warning(
-                "redirecting away from attack target=%s (confirmedDead=%s "
-                "noDamageLanded=%s targetHealing=%s prevHp=%s curHp=%s ep=%s) ",
-                current_target, target_confirmed_dead, no_damage_landed,
-                target_healing, previously_seen_hp, current_target_hp,
-                self_state.get("ep"),
-            )
+            log_info_block("⚠️ SERANGAN GAGAL / TARGET KEBAL", {
+                "target id": current_target,
+                "alasan": "Target mati / Serangan tidak tembus / Target nge-heal",
+                "tindakan": "Batal menyerang dan cari aman"
+            })
             connections = (view.get("currentRegion") or {}).get("connections") or []
             if connections:
                 decision = Decision(
@@ -656,12 +633,11 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
         else:
             session.consecutive_same_target = 0
 
+        # --- PERBAIKAN LOG WARNING RUIN NYANGKUT ---
         if session.consecutive_same_target >= 1:
-            log.warning(
-                "refusing to repeat explore on target=%s again without a fresh "
-                "turn (hp=%s) — falling back to repositioning instead",
-                current_target, hp,
-            )
+            log_info_block("⚠️ RUIN NYANGKUT ATAU HABIS", {
+                "tindakan": "Menghindari loop eksploitasi, otomatis pindah area."
+            })
             connections = (view.get("currentRegion") or {}).get("connections") or []
             if connections:
                 decision = Decision(
@@ -691,7 +667,6 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
         "action": decision.kind,
         "target": target_display,
         "alasan": decision.reason,
-        "hp saat ini": hp,
     })
 
     await ws.send(json.dumps(payload))
@@ -705,18 +680,14 @@ async def run_one_game(rest: RestClient, entry_type: str) -> str:
         "X-API-Key": rest.api_key,
         "X-Version": rest.version,
     }
-
     join_started_at = time.monotonic()
-
     try:
-        # Menggunakan additional_headers untuk websockets
         async with websockets.connect(
             WS_JOIN_URL, additional_headers=headers, ping_interval=20, ping_timeout=20
         ) as ws:
             welcome_raw = await ws.recv()
             welcome = json.loads(welcome_raw)
-            log.info("welcome frame: %s", json.dumps(welcome)[:400])
-
+            
             if welcome.get("type") == "welcome":
                 decision = welcome.get("decision")
                 if decision == "BLOCKED":
@@ -731,20 +702,11 @@ async def run_one_game(rest: RestClient, entry_type: str) -> str:
 
     except ConnectionClosed as e:
         waited = time.monotonic() - join_started_at
-        log.warning(
-            "websocket closed: code=%s reason=%s (after %.1fs since connect)",
-            e.code, e.reason, waited,
-        )
         if e.code == 1006 and waited < 120:
-            log.info(
-                "1006 while still in matchmaking queue — likely server-side "
-                "idle/matchmaking timeout, not a bot bug. Will retry."
-            )
-        if e.code == 1013:
-            log.info("RESUME_TARGET_DEAD — will re-dial for a fresh assignment")
+            log.info("Menunggu matchmaking... (Timeout biasa dari server, akan retry otomatis)")
+        elif e.code == 1013:
             return "resume_dead"
-        if e.code == 4032:
-            log.info("agent already dead in that game — dropping it")
+        elif e.code == 4032:
             return "died"
         return "closed"
 
@@ -768,18 +730,13 @@ async def choose_entry_type(rest: RestClient) -> Optional[str]:
     if ENTRY_TYPE_PREFERENCE == "paid":
         if paid_live or readiness.get("paidReady"):
             return "paid"
-        log.info("paid requested but not ready/live — falling back to free")
         return "free"
-
     if ENTRY_TYPE_PREFERENCE == "free":
         return "free"
 
-    if paid_live:
-        return "paid"
-    if free_live:
-        return "free"
-    if readiness.get("paidReady"):
-        return "paid"
+    if paid_live: return "paid"
+    if free_live: return "free"
+    if readiness.get("paidReady"): return "paid"
     return "free"
 
 
@@ -799,12 +756,10 @@ async def main_loop() -> None:
         try:
             loop.add_signal_handler(sig, _handle_signal)
         except NotImplementedError:
-            pass  # Windows dev fallback
+            pass 
 
     async with RestClient(API_KEY) as rest:
         await rest.fetch_version()
-        log.info("using X-Version=%s", rest.version)
-
         try:
             me = await rest.get_me()
             readiness = me.get("readiness", {}) or {}
@@ -812,14 +767,11 @@ async def main_loop() -> None:
                 "nama": me.get("name"),
                 "balance": f"{me.get('balance')} sMoltz",
                 "wallet ok": readiness.get("walletAddress"),
-                "whitelist": readiness.get("whitelistApproved"),
-                "SC wallet": readiness.get("scWallet"),
-                "identity": readiness.get("identity"),
                 "sMoltz cukup": readiness.get("sMoltzSufficient"),
                 "paid ready": readiness.get("paidReady"),
             })
         except ApiError as e:
-            log.error("could not fetch account — check CLAW_API_KEY: %s", e)
+            log.error("could not fetch account: %s", e)
             sys.exit(1)
 
         reconnect_delay = RECONNECT_MIN_DELAY
@@ -828,14 +780,11 @@ async def main_loop() -> None:
             try:
                 entry_type = await choose_entry_type(rest)
                 if entry_type is None:
-                    log.info("nothing to do right now — idling")
                     await asyncio.sleep(STATE_POLL_INTERVAL)
                     continue
 
                 await ensure_loadout(rest)
-
                 outcome = await run_one_game(rest, entry_type)
-                log.info("game outcome: %s", outcome)
 
                 if outcome in ("died", "ended", "resume_dead"):
                     reconnect_delay = RECONNECT_MIN_DELAY
@@ -846,16 +795,7 @@ async def main_loop() -> None:
                     await asyncio.sleep(reconnect_delay)
                     reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
 
-            except ApiError as e:
-                log.error("API error in main loop: %s", e)
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
-            except (ConnectionClosed, OSError) as e:
-                log.warning("connection issue: %s — backing off %.1fs", e, reconnect_delay)
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
             except Exception:
-                log.exception("unexpected error in main loop")
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
 
