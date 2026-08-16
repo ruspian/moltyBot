@@ -41,12 +41,15 @@ RECONNECT_MAX_DELAY = float(os.environ.get("CLAW_RECONNECT_MAX_DELAY", "30"))
 INTER_GAME_DELAY = float(os.environ.get("CLAW_INTER_GAME_DELAY", "3"))
 
 # File terpisah untuk log error, supaya tidak merusak layar Dashboard (yang pakai stdout).
-LOG_FILE = os.environ.get("CLAW_LOG_FILE", "clawroyale.log")
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s: %(message)s",
-    filename=LOG_FILE,
-)
+# Default ke /tmp karena direktori kerja/app di banyak container bersifat read-only.
+LOG_FILE = os.environ.get("CLAW_LOG_FILE", "/tmp/clawroyale.log")
+_LOG_FORMAT = "%(asctime)s %(levelname)s: %(message)s"
+try:
+    logging.basicConfig(level=LOG_LEVEL, format=_LOG_FORMAT, filename=LOG_FILE)
+except OSError:
+    # Tidak bisa menulis file log di lokasi manapun yang dicoba — jangan sampai
+    # bot gagal start hanya karena logging. Pakai stderr sebagai fallback.
+    logging.basicConfig(level=LOG_LEVEL, format=_LOG_FORMAT, stream=sys.stderr)
 log = logging.getLogger("clawroyale")
 
 # --------------------------------------------------------------------------
