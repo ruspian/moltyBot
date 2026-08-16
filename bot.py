@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+a#!/usr/bin/env python3
 """
 Claw Royale agent bot.
 
@@ -23,28 +23,6 @@ Flow (per skill.md / openapi.yaml):
     game_ended -> read result, go back to matchmaking
 
 Config is via environment variables — see .env.example / docker-compose.yml.
-
---------------------------------------------------------------------------
-Changelog (from the "stuck 9 turns / died with HP still high" incident):
-
-1. Move-success verification. We never pinned down the exact WS payload
-   field name the server expects for a move target (same class of
-   uncertainty as the earlier no-damage attack issue), so rather than
-   guess a different field name, this now checks empirically: after
-   sending a move, did currentRegion.id actually change on the next
-   state update? If it keeps not changing, that's logged loudly (and
-   dumped in full after 3 consecutive failures) instead of silently
-   repeating forever. This looks like the likely root cause of the
-   incident — the bot was "moving" every turn but never leaving the
-   region, and something independent of combat HP killed it anyway.
-
-2. Explore-repeat guard fix. The old guard only compared against
-   session.last_decision_kind == "explore", so it caught two explores
-   in a row but NOT the explore -> move -> explore -> move pattern seen
-   in the logs (where last_decision_kind was "move" at the moment of
-   the check, every time). It now tracks the ruin id directly across
-   whatever actions happen in between.
---------------------------------------------------------------------------
 """
 
 from __future__ import annotations
@@ -533,21 +511,9 @@ class GameSession:
     last_equipment_signature: Optional[str] = None
     dangerous_regions: set = field(default_factory=set)  # regionId -> seen a big HP drop here
     recently_healed_items: set = field(default_factory=set)  # itemId -> already auto-healed with this
-    # Move-success verification (see the agent_view handler in
-    # play_session). We don't have a confirmed schema for the move
-    # payload's target field, so instead of guessing a different field
-    # name, this tracks what region we were in and what we asked to move
-    # to, then checks on the next state update whether it actually
-    # changed. This is what catches the "stuck N turns in the same
-    # region, HP never drops, died anyway" pattern instead of silently
-    # repeating a no-op move forever.
-    region_before_last_move: Optional[str] = None
     last_move_target_region: Optional[str] = None
-    consecutive_failed_moves: int = 0
-    # Explore-repeat guard target, tracked by ruin id independently of
-    # last_decision_kind so an explore -> move -> explore sequence on the
-    # SAME ruin still gets caught even with "move" sitting in between.
-    last_explore_target: Optional[str] = None
+    region_before_last_move: Optional[str] = None
+    move_attempts_stuck_count: int = 0  # consecutive moves that didn't change our region
 
 
 async def send_hello(ws, entry_type: str) -> None:
@@ -603,6 +569,32 @@ async def play_session(ws, session: GameSession) -> str:
             visible_monsters = view.get("visibleMonsters") or []
             visible_ruins = view.get("visibleRuins") or []
 
+            # Diagnostic: verify a previously-sent move actually landed.
+            # We compare against the region we were IN before sending that
+            # move (session.region_before_last_move), not against the
+            # target we tried to reach — "stuck in the same region" means
+            # current == previous, regardless of which target we asked for.
+            if (
+                session.last_move_target_region is not None
+                and session.region_before_last_move is not None
+            ):
+                if current_region_id == session.region_before_last_move:
+                    session.move_attempts_stuck_count += 1
+                    if session.move_attempts_stuck_count >= 2:
+                        log_info_block("🚨 MOVE TIDAK BERPENGARUH", {
+                            "percobaan gagal beruntun": session.move_attempts_stuck_count,
+                            "region saat ini": current_region_id,
+                            "target terakhir dikirim": session.last_move_target_region,
+                            "kesimpulan": (
+                                "action 'move' kemungkinan tidak diproses server "
+                                "sebagai perpindahan — field payload mungkin salah"
+                            ),
+                        })
+                else:
+                    session.move_attempts_stuck_count = 0
+                session.last_move_target_region = None
+                session.region_before_last_move = None
+
             hp_display = (
                 f"{new_hp}/{new_max_hp}" if new_max_hp else str(new_hp)
             )
@@ -620,47 +612,6 @@ async def play_session(ws, session: GameSession) -> str:
                 "alert gauge": new_self.get("alertGauge"),
                 "update type": f"{ftype} ({reason})" if reason else ftype,
             })
-
-            # Move-success verification. Did currentRegion.id actually
-            # change after we sent a move last turn? If it keeps NOT
-            # changing, the server is accepting the action but position
-            # isn't updating — same class of symptom as the earlier
-            # no-damage attack issue. Log loudly, and after 3 consecutive
-            # failures dump the full raw view so the exact payload schema
-            # can be worked out from real server behavior instead of more
-            # guessing.
-            if session.last_move_target_region is not None:
-                moved_from = session.region_before_last_move
-                if current_region_id == moved_from:
-                    session.consecutive_failed_moves += 1
-                    log.warning(
-                        "move appears to have FAILED: still in region=%s after "
-                        "requesting move to %s (consecutive_failed_moves=%d) — "
-                        "server accepted the action but position did not change; "
-                        "the payload field name for 'move' in "
-                        "build_action_payload() may be wrong",
-                        moved_from, session.last_move_target_region,
-                        session.consecutive_failed_moves,
-                    )
-                    if session.consecutive_failed_moves >= 3:
-                        log.error(
-                            "move has failed to change region %d turns in a row "
-                            "while stuck in region=%s — dumping full raw view for "
-                            "inspection: %s",
-                            session.consecutive_failed_moves, moved_from,
-                            json.dumps(view, default=str),
-                        )
-                else:
-                    if session.consecutive_failed_moves:
-                        log.info(
-                            "move succeeded — region changed %s -> %s after %d "
-                            "failed attempt(s)",
-                            moved_from, current_region_id,
-                            session.consecutive_failed_moves,
-                        )
-                    session.consecutive_failed_moves = 0
-                session.last_move_target_region = None
-                session.region_before_last_move = None
 
             # Equipment snapshot — weapon + inventory items, logged only when
             # it actually changes so this doesn't spam every single turn.
@@ -705,7 +656,7 @@ async def play_session(ws, session: GameSession) -> str:
                 and new_hp is not None
                 and (prev_hp - new_hp) >= HP_DROP_DIAGNOSTIC_THRESHOLD
             ):
-                danger_region_id = current_region_id
+                danger_region_id = (view.get("currentRegion") or {}).get("id")
                 if danger_region_id:
                     session.dangerous_regions.add(danger_region_id)
                 log.warning(
@@ -737,10 +688,20 @@ async def play_session(ws, session: GameSession) -> str:
                 session.can_act = can_act
             cooldown_ms = frame.get("cooldownRemainingMs")
             error = frame.get("error") or {}
-            log.info(
-                "action_result success=%s canAct=%s cooldownRemainingMs=%s error=%s",
-                success, can_act, cooldown_ms, error,
-            )
+
+            if not success:
+                log_info_block("⚠️ AKSI GAGAL (action_result)", {
+                    "action yang dikirim": session.last_decision_kind,
+                    "target": session.last_action_target,
+                    "error code": error.get("code"),
+                    "error message": error.get("message"),
+                    "canAct": can_act,
+                })
+            else:
+                log.debug(
+                    "action_result success=%s canAct=%s cooldownRemainingMs=%s",
+                    success, can_act, cooldown_ms,
+                )
             # TARGET_DEAD (1.15.0) is the authoritative "that target is
             # already dead" signal — distinct from AGENT_DEAD (our own
             # death). Remember it so the repeat-attack guard can retarget
@@ -938,21 +899,21 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
                 session.last_seen_target_hp[current_target] = current_target_hp
             session.last_action_target = current_target
 
-    # Explore uses a ruin-id-based repeat guard: track the ruin we last
-    # tried to explore directly, independent of session.last_decision_kind,
-    # so an explore -> move -> explore sequence on the SAME ruin (the
-    # pattern seen in the stuck/died log — where a "move" that silently
-    # failed to relocate us sat in between) still trips the guard. Ruins
-    # don't expose an HP-style signal to confirm progress the way attack
-    # targets do, so this still can't distinguish "still working on it"
-    # from "stuck" — it just refuses to repeat the exact same ruin twice
-    # in a row, whatever happened in between.
+    # Explore still uses a simple repeat block: ruins don't expose an
+    # HP-style signal to confirm progress, so we can't tell "still working
+    # on it" from "stuck" the way we can for attack. Track by ruin id
+    # directly (not by "was the last action also explore") — a move in
+    # between (even one that got redirected) must not reset this, or the
+    # guard becomes a no-op whenever explore and move alternate, which is
+    # exactly the pattern observed: explore -> move -> explore -> move on
+    # the same ruin for 9+ turns, never blocked because last_decision_kind
+    # was "move" every time this check ran.
     elif decision.kind == "explore" and current_target:
-        if current_target == session.last_explore_target:
+        if current_target == session.last_explored_ruin_id:
             session.consecutive_same_target += 1
         else:
             session.consecutive_same_target = 0
-        session.last_explore_target = current_target
+            session.last_explored_ruin_id = current_target
 
         if session.consecutive_same_target >= 1:
             log.warning(
@@ -970,7 +931,6 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
             else:
                 decision = Decision(kind="wait", reason="breaking repeat loop, no exit")
             session.consecutive_same_target = 0
-            session.last_explore_target = None
             session.last_action_target = None
         else:
             session.last_action_target = current_target
@@ -978,18 +938,9 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
         # move/wait/other kinds don't carry a repeatable target — leave
         # last_action_target as-is so a subsequent attack/explore decision
         # can still be compared against the last REAL target we acted on.
-        # (last_explore_target is intentionally NOT reset here — it must
-        # survive an interleaving move so the guard above can still catch
-        # the explore -> move -> explore pattern.)
         session.consecutive_same_target = 0
 
     session.last_decision_kind = decision.kind
-
-    if decision.kind == "move" and decision.target_region_id:
-        # Record what we're about to attempt so the agent_view handler can
-        # verify next turn whether the region actually changed.
-        session.region_before_last_move = (view.get("currentRegion") or {}).get("id")
-        session.last_move_target_region = decision.target_region_id
 
     payload = build_action_payload(decision)
     target_display = (
@@ -1006,6 +957,10 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
     })
 
     await ws.send(json.dumps(payload))
+
+    if decision.kind == "move" and decision.target_region_id:
+        session.last_move_target_region = decision.target_region_id
+        session.region_before_last_move = (view.get("currentRegion") or {}).get("id")
 
     if is_cooldown_action(decision.kind):
         # Optimistically mark canAct False until the server confirms via
