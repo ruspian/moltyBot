@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Claw Royale agent bot.
-(Aggressive Mode: Flash Looting, Equip Best Weapon, NO RETREAT)
+(Aggressive Mode: Flash Looting, Smart Equip Armor & Weapon, Auto-Energy, NO RETREAT)
 """
 
 from __future__ import annotations
@@ -184,13 +184,16 @@ def is_cooldown_action(kind: str) -> bool:
 
 
 def decide_free_actions(view: dict) -> list[Decision]:
-    """Menentukan Free Actions (0 Cooldown). Dioptimalkan untuk FAST LOOTING & SMART EQUIP."""
+    """Menentukan Free Actions (0 Cooldown). Dioptimalkan untuk FAST LOOTING & SMART EQUIP (Weapon + Armor)."""
     free_decisions = []
     self_state = view.get("self", {}) or {}
     inventory = self_state.get("inventory") or []
     equipped_weapon = self_state.get("equippedWeapon")
+    equipped_armor = self_state.get("equippedArmor")
     
+    # ---------------------------------------------------------
     # 1. AUTO-EQUIP SENJATA TERBAIK
+    # ---------------------------------------------------------
     all_weapons = [i for i in inventory if i.get("category") == "weapon"]
     
     if equipped_weapon:
@@ -218,8 +221,39 @@ def decide_free_actions(view: dict) -> list[Decision]:
                 reason=f"auto-equip senjata TERKUAT: {best_weapon.get('name')} (Power: {dmg})"
             ))
 
-    # 2. FAST AUTO-PICKUP (Sapu Bersih Lootingan)
-    # Memindai seluruh key JSON yang mungkin menyimpan barang di tanah (antisipasi update server)
+    # ---------------------------------------------------------
+    # 2. AUTO-EQUIP ARMOR TERBAIK
+    # ---------------------------------------------------------
+    all_armors = [i for i in inventory if i.get("category") in ["armor", "equipment"]]
+    
+    if equipped_armor:
+        if isinstance(equipped_armor, dict):
+            all_armors.append(equipped_armor)
+
+    if all_armors:
+        def armor_score(a):
+            return a.get("defense", 0) or a.get("def", 0) or a.get("armor", 0) or a.get("hpMax", 0) or 0
+        
+        best_armor = max(all_armors, key=armor_score)
+        
+        is_already_equipped_armor = False
+        if equipped_armor:
+            if isinstance(equipped_armor, dict) and equipped_armor.get("id") == best_armor.get("id"):
+                is_already_equipped_armor = True
+            elif isinstance(equipped_armor, str) and equipped_armor == best_armor.get("id"):
+                is_already_equipped_armor = True
+                
+        if not is_already_equipped_armor and best_armor.get("id"):
+            def_val = armor_score(best_armor)
+            free_decisions.append(Decision(
+                kind="equip", 
+                item_id=best_armor.get("id"), 
+                reason=f"auto-equip ARMOR TERKUAT: {best_armor.get('name')} (Def/HP Bonus: {def_val})"
+            ))
+
+    # ---------------------------------------------------------
+    # 3. FAST AUTO-PICKUP (Sapu Bersih Lootingan)
+    # ---------------------------------------------------------
     raw_visible_items = []
     if isinstance(view.get("visibleItems"), list):
         raw_visible_items.extend(view.get("visibleItems"))
@@ -229,7 +263,6 @@ def decide_free_actions(view: dict) -> list[Decision]:
         if isinstance(current_region.get(key), list):
             raw_visible_items.extend(current_region.get(key))
 
-    # Hapus duplikat berdasarkan ID agar tidak spam error
     unique_items = {item.get("id"): item for item in raw_visible_items if item.get("id")}
     
     if unique_items:
@@ -240,7 +273,7 @@ def decide_free_actions(view: dict) -> list[Decision]:
             free_decisions.append(Decision(
                 kind="pickup",
                 item_id=item_id,
-                reason=f"⚡ FAST LOOT: Mengambil barang {item.get('name', 'Unknown Item')}"
+                reason=f"⚡ FAST LOOT: Mengambil {item.get('name', 'Unknown Item')}"
             ))
             inv_count += 1
             
@@ -248,7 +281,7 @@ def decide_free_actions(view: dict) -> list[Decision]:
 
 
 def decide(view: dict) -> Decision:
-    """Action Utama (Cooldown Action) - MODE BARBAR, TANPA TAKUT"""
+    """Action Utama (Cooldown Action) - MODE BARBAR, TANPA TAKUT + AUTO ENERGY"""
     self_state = view.get("self", {}) or {}
     hp = self_state.get("hp", 100)
     max_hp_guess = self_state.get("maxHp", 100) or 100
@@ -263,48 +296,64 @@ def decide(view: dict) -> Decision:
     pending_deathzones = view.get("pendingDeathzones") or []
 
     hp_ratio = hp / max_hp_guess if max_hp_guess else 1.0
+    
+    inventory_items = self_state.get("inventory") or []
+    recovery_items = [i for i in inventory_items if i.get("category") in ["recovery", "consumable"]]
 
-    # 1) Evakuasi Death Zone (Satu-satunya alasan bot boleh kabur)
+    # ---------------------------------------------------------
+    # 1. SURVIVAL & RECOVERY (KABUR, HEAL, & ISI ENERGI)
+    # ---------------------------------------------------------
+
+    # 1.1) Evakuasi Death Zone (Wajib kabur kalau zona mau mati)
     pending_here_ids = {dz.get("id") for dz in pending_deathzones}
     if is_death_zone or current_region.get("id") in pending_here_ids:
         safe_targets = [c for c in connections]
         if safe_targets:
             return Decision(kind="move", target_region_id=random.choice(safe_targets), reason="evacuating death zone")
 
-    # 1.5) Auto-heal
-    inventory_items = self_state.get("inventory") or []
-    recovery_items = [i for i in inventory_items if i.get("category") == "recovery"]
+    # 1.2) Auto-Heal (Prioritas utama jika HP < 60%)
     if hp_ratio < 0.60 and recovery_items:
-        best_item = max(recovery_items, key=lambda i: i.get("hpRestore", 0))
-        if best_item.get("hpRestore", 0) > 0:
-            return Decision(kind="use_item", item_id=best_item.get("id"), reason=f"auto-heal: using {best_item.get('name')}")
+        best_hp_item = max(recovery_items, key=lambda i: i.get("hpRestore", 0))
+        if best_hp_item.get("hpRestore", 0) > 0:
+            return Decision(kind="use_item", item_id=best_hp_item.get("id"), reason=f"auto-heal: using {best_hp_item.get('name')}")
 
-    # ==========================================
-    # MODE BARBAR: POKOKNYA ATTACK KALAU ADA MUSUH
-    # ==========================================
+    # 1.3) Auto-Energy (Isi Stamina jika EP < 2 supaya bisa nyerang terus)
+    if ep < 2 and recovery_items:
+        def ep_score(i):
+            return i.get("epRestore", 0) or i.get("spRestore", 0) or i.get("energyRestore", 0) or 0
+            
+        best_ep_item = max(recovery_items, key=ep_score)
+        if ep_score(best_ep_item) > 0:
+            return Decision(kind="use_item", item_id=best_ep_item.get("id"), reason=f"auto-energy: ngisi stamina pakai {best_ep_item.get('name')}")
 
-    # 2) Serang Agent (Pemain Lain)
+    # ---------------------------------------------------------
+    # 2. MODE BARBAR: POKOKNYA ATTACK KALAU ADA MUSUH
+    # ---------------------------------------------------------
+
+    # Serang Agent (Pemain Lain)
     if visible_agents and ep > 0:
         non_guardian = [a for a in visible_agents if not a.get("isGuardian")]
         if non_guardian:
             weakest = min(non_guardian, key=lambda a: a.get("hp", 999))
             return Decision(kind="attack", target_agent_id=weakest.get("id"), reason="MODE BARBAR: Menghajar Agent terlemah di map!")
             
-    # 3) Serang Monster (Kalau ga ada Agent)
+    # Serang Monster (Kalau ga ada Agent)
     if visible_monsters and ep > 0:
         weakest_monster = min(visible_monsters, key=lambda m: m.get("hp", 999))
         return Decision(kind="attack", target_monster_id=weakest_monster.get("id"), reason="MODE BARBAR: Menghabisi Monster untuk loot!")
 
-    # ==========================================
+    # ---------------------------------------------------------
+    # 3. INTERAKSI & EKSPLORASI
+    # ---------------------------------------------------------
 
-    # 4) Didalam Cave -> Gunakan "interact" untuk keluar
+    # Didalam Cave -> Gunakan "interact" untuk keluar
     if in_cave:
         facilities = view.get("visibleFacilities") or current_region.get("facilities") or []
         if facilities:
             return Decision(kind="interact", interactable_id=facilities[0].get("id"), reason="using facility to exit cave")
         return Decision(kind="interact", reason="in cave — attempting generic interact to exit")
 
-    # 5) Explore Ruin (Mencari loot jika sedang kosong)
+    # Explore Ruin (Mencari loot jika sedang kosong dan aman)
     alert_active = self_state.get("alertActive", False)
     alert_gauge = self_state.get("alertGauge", 0) or 0
     if visible_ruins and not alert_active and alert_gauge <= 6:
@@ -312,7 +361,7 @@ def decide(view: dict) -> Decision:
         if ruin:
             return Decision(kind="explore", ruin_id=ruin.get("ruinId"), reason=f"exploring ruin (alertGauge={alert_gauge})")
 
-    # 6) Hunting - Reposisi cari musuh/loot jika sedang idle
+    # Hunting - Reposisi cari musuh/loot jika sedang idle
     if connections:
         return Decision(kind="move", target_region_id=random.choice(connections), reason="Hunting: mencari musuh/loot di region lain")
 
@@ -404,7 +453,7 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
 
     hp = self_state.get("hp")
 
-    # ----- PROSES FREE ACTIONS (Flash Looting & Equip) -----
+    # ----- PROSES FREE ACTIONS (Flash Looting & Smart Equip) -----
     free_actions = decide_free_actions(view)
     for fd in free_actions:
         payload = build_action_payload(fd)
@@ -551,15 +600,18 @@ async def play_session(ws, session: GameSession) -> str:
                 })
                 
                 equipped_weapon = new_self.get("equippedWeapon")
+                equipped_armor = new_self.get("equippedArmor")
                 inventory_items = new_self.get("inventory") or []
-                equip_signature = json.dumps({"weapon": equipped_weapon, "inventory": inventory_items}, sort_keys=True)
+                equip_signature = json.dumps({"weapon": equipped_weapon, "armor": equipped_armor, "inventory": inventory_items}, sort_keys=True)
                 
                 if equip_signature != session.last_equipment_signature:
                     session.last_equipment_signature = equip_signature
                     item_lines = {it.get("name", f"item {i}"): f"x{it.get('quantity', 1)}" for i, it in enumerate(inventory_items)}
                     weapon_name = equipped_weapon.get("name") if isinstance(equipped_weapon, dict) else equipped_weapon
+                    armor_name = equipped_armor.get("name") if isinstance(equipped_armor, dict) else equipped_armor
                     log_info_block("Equipment", {
                         "weapon": weapon_name or "(kosong)",
+                        "armor": armor_name or "(kosong)",
                         **(item_lines or {"item": "(kosong)"}),
                     })
 
