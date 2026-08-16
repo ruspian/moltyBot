@@ -23,6 +23,75 @@ Flow (per skill.md / openapi.yaml):
     game_ended -> read result, go back to matchmaking
 
 Config is via environment variables — see .env.example / docker-compose.yml.
+
+--------------------------------------------------------------------------
+Changelog:
+
+1. Move-success verification (region-changed check on the turn after a
+   move) and 2. an explore-repeat guard fix (tracks the ruin id directly
+   instead of only comparing against the immediately-previous action)
+   were added after live runs showed a "stuck 9 turns, HP fine, died
+   anyway" pattern.
+
+3. ROOT CAUSE FOUND AND FIXED: the WS action envelope itself was wrong.
+   This bot was sending flat payloads like
+     {"type": "action", "action": "move", "targetRegionId": "..."}
+   but the real server contract (references/actions.md + a working
+   reference implementation, both from github.com/ruspian/molty5) wants
+   the action nested under "data" with its OWN "type" key, and different
+   field names:
+     {"type": "action", "data": {"type": "move", "regionId": "..."}}
+   actions.md even calls this out by name under its gotchas: "do not
+   wrap actions in the old HTTP `{ "action": ... }` body shape" — which
+   is exactly the shape this bot was using. This one bug plausibly
+   explains every prior symptom at once: moves that never changed
+   currentRegion.id, attacks that never landed damage, and possibly
+   silent no-ops on every other action too, all while action_result's
+   `success` field defaulted to True in this bot whenever it happened to
+   be missing/misread — masking outright rejections as "success".
+
+   Corrected field names (source: references/actions.md, cross-checked
+   against ruspian/molty5's bot/game/action_sender.py which builds
+   these same envelopes and is presumably working against the real
+   server):
+     move:     {"type": "move", "regionId": "..."}
+     attack:   {"type": "attack", "targetId": "...", "targetType": "agent"|"monster"}
+     use_item: {"type": "use_item", "itemId": "..."}
+     explore:  {"type": "explore"}  — NOTE: actions.md marks this
+               "currently disabled (action rebuild in progress) — do not
+               submit" server-side. Left wired up rather than guessed
+               away, since this bot's own logs showed explore actions
+               going out during real games; watch the (now-fixed)
+               action_result error logging for INVALID_ACTION-style
+               rejections to see whether that applies to this specific
+               deployment.
+
+   Two more bugs fell out of implementing the real spec correctly:
+     a. use_item is actually IN the cooldown group per actions.md
+        (costs 1 EP, triggers the 60s cooldown) — this bot had it
+        classified as a free action and was sending a heal AND a
+        separate move/attack/explore in the same turn. That second
+        action would have been sent while still on cooldown from the
+        first, which the real server most likely rejects. The special
+        "send heal then immediately decide again" path is removed;
+        use_item now goes through the same single-action-per-turn path
+        as everything else.
+     b. "wait" was being sent to the server as a literal
+        {"action": "wait"} — not a real action type in actions.md at
+        all. It's now mapped to the real "rest" action (0 EP, still
+        consumes the cooldown turn, but grants +1 bonus EP instead of
+        silently doing nothing / getting rejected).
+
+   Left untouched (and worth flagging, not fixing blind): actions.md's
+   own join/connection docs describe a REST `POST /api/join` (long-poll)
+   flow followed by connecting straight to `/ws/agent` with no join
+   handshake message — different from this bot's `/ws/join` + `hello`
+   WebSocket handshake. Since this bot's handshake has empirically been
+   getting into real games (turns advancing, HP changing, deaths), and
+   the reference docs' host (cdn.moltyroyale.com) differs from this
+   bot's default (cdn.clawroyale.ai), that connection layer was left as
+   is rather than "fixed" against what may be a different game/host.
+--------------------------------------------------------------------------
 """
 
 from __future__ import annotations
@@ -285,12 +354,6 @@ async def ensure_loadout(rest: RestClient) -> None:
 # EP used ASC -> agent id ASC. Remaining HP does not matter by itself.
 # So the guiding principle is: SURVIVE FIRST, fight only when it does not
 # cost you survival time, never trade survival time for a kill.
-#
-# Exact WS action payload field names are not pinned down in the material
-# available to this bot, so `decide()` returns an abstract Decision and
-# `send_action()` renders it defensively (tries the most standard shape;
-# logs the raw server response either way so you can see exactly what the
-# server accepted/rejected and tighten this mapping over time).
 
 @dataclass
 class Decision:
@@ -304,10 +367,13 @@ class Decision:
 
 
 def is_cooldown_action(kind: str) -> bool:
-    # move / attack / explore consume the turn and enter a cooldown group;
-    # pickup / equip / talk / whisper / broadcast are free per the docs —
-    # so using a heal item does NOT block the next real action this turn.
-    return kind in {"move", "attack", "explore"}
+    # Per references/actions.md §2, the real cooldown group is:
+    # move, attack, use_item, interact, rest (and explore, though currently
+    # disabled server-side). use_item was previously (wrongly) treated as
+    # free here. "wait" isn't a real server action - build_action_payload()
+    # maps it to "rest", which DOES consume the cooldown, so it belongs in
+    # this set too. Only pickup/equip/talk/whisper/broadcast are free.
+    return kind in {"move", "attack", "explore", "use_item", "wait"}
 
 
 def decide(view: dict) -> Decision:
@@ -342,17 +408,10 @@ def decide(view: dict) -> Decision:
             )
 
     # 1.5) Auto-heal: use a recovery item from inventory when HP is low.
-    #    This is a FREE action (doesn't consume the turn per skill.md's
-    #    free-action list) — maybe_act sends this first, then still sends
-    #    a real move/attack/explore afterward this same turn. Checked here,
-    #    right after the death-zone emergency-exit check but BEFORE
-    #    crowded-region and critical-HP retreat: since healing costs
-    #    nothing, there's no downside to healing before also retreating —
-    #    but every check below this one used to `return` unconditionally,
-    #    which made this code unreachable whenever it mattered most. That
-    #    caused the bot to sit at 20/100 HP for 3+ turns while carrying
-    #    unused Emergency Food, since critical-HP retreat kept firing
-    #    first and returning before this ever ran.
+    #    NOTE: use_item is a COOLDOWN action per actions.md (costs 1 EP,
+    #    triggers the 60s cooldown) — it is NOT free. This just returns
+    #    the heal as THIS turn's action like any other; maybe_act no
+    #    longer sends a second action in the same turn afterward.
     inventory_items = self_state.get("inventory") or []
     recovery_items = [i for i in inventory_items if i.get("category") == "recovery"]
     if hp_ratio < 0.75 and recovery_items:
@@ -435,7 +494,10 @@ def decide(view: dict) -> Decision:
     # 5) In a cave -> the only way out is to interact the same
     #    interactableId used to enter; this bot does not track that id
     #    across turns (kept out of scope), so default to waiting it out
-    #    unless a specific integration adds tracking.
+    #    unless a specific integration adds tracking. (references/actions.md
+    #    documents a real "interact" action - {"type": "interact",
+    #    "interactableId": "..."} - so wiring this up properly is a
+    #    reasonable next step, just not done here.)
     if in_cave:
         return Decision(kind="wait", reason="in cave — awaiting explicit exit handling")
 
@@ -444,6 +506,12 @@ def decide(view: dict) -> Decision:
     #    clear); at gauge 10 guardians actively hunt you. Back off well
     #    before alertActive actually triggers, and require more HP margin
     #    than other actions since a ruin ambush can hit hard.
+    #    NOTE: references/actions.md marks explore as "currently disabled
+    #    (action rebuild in progress)" server-side as of that doc's
+    #    version. Left enabled here since this bot's own logs showed
+    #    explore actions going out in real games — watch for an
+    #    INVALID_ACTION-style rejection in the (now-fixed) action_result
+    #    error logging to confirm whether that applies to this deployment.
     alert_active = self_state.get("alertActive", False)
     alert_gauge = self_state.get("alertGauge", 0) or 0
     if visible_ruins and not alert_active and alert_gauge <= 4 and hp_ratio >= 0.7:
@@ -470,24 +538,43 @@ def decide(view: dict) -> Decision:
 
 
 def build_action_payload(decision: Decision) -> dict:
-    """Best-effort mapping from Decision -> the WS action message.
-    Confirm/adjust field names against real `action_result` responses —
-    the bot logs the full raw frame for exactly this purpose."""
+    """Build the WS action envelope per references/actions.md, cross-checked
+    against a real working implementation (ruspian/molty5's
+    bot/game/action_sender.py). The envelope nests the action under "data"
+    with its OWN "type" key - NOT the flat {"action": kind, ...} shape this
+    bot was sending before, which actions.md explicitly calls out as wrong:
+    "do not wrap actions in the old HTTP `{ "action": ... }` body shape."
 
-    payload: dict[str, Any] = {"type": "action", "action": decision.kind}
+        {"type": "action", "data": {"type": "move", "regionId": "..."}}
+
+    "wait" isn't a real action type in the spec - closest real equivalent
+    is "rest" (0 EP, still consumes the cooldown turn, grants +1 bonus EP
+    instead of silently doing nothing).
+    """
+
+    data: dict[str, Any] = {}
 
     if decision.kind == "move" and decision.target_region_id:
-        payload["targetRegionId"] = decision.target_region_id
+        data = {"type": "move", "regionId": decision.target_region_id}
     elif decision.kind == "attack":
-        if decision.target_agent_id:
-            payload["targetAgentId"] = decision.target_agent_id
-        elif decision.target_monster_id:
-            payload["targetMonsterId"] = decision.target_monster_id
-    elif decision.kind == "explore" and decision.ruin_id:
-        payload["ruinId"] = decision.ruin_id
+        target_id = decision.target_agent_id or decision.target_monster_id
+        if target_id:
+            target_type = "agent" if decision.target_agent_id else "monster"
+            data = {"type": "attack", "targetId": target_id, "targetType": target_type}
+    elif decision.kind == "explore":
+        data = {"type": "explore"}
     elif decision.kind == "use_item" and decision.item_id:
-        payload["itemId"] = decision.item_id
+        data = {"type": "use_item", "itemId": decision.item_id}
+    elif decision.kind == "wait":
+        data = {"type": "rest"}
+    else:
+        data = {"type": decision.kind}
 
+    payload: dict[str, Any] = {"type": "action", "data": data}
+    if decision.reason:
+        # Cap per actions.md's "Thought reasoning: 500 chars, exceeding
+        # causes validation failure".
+        payload["thought"] = {"reasoning": decision.reason[:500]}
     return payload
 
 
@@ -510,10 +597,19 @@ class GameSession:
     last_seen_target_hp: dict = field(default_factory=dict)  # targetId -> hp
     last_equipment_signature: Optional[str] = None
     dangerous_regions: set = field(default_factory=set)  # regionId -> seen a big HP drop here
-    recently_healed_items: set = field(default_factory=set)  # itemId -> already auto-healed with this
-    last_move_target_region: Optional[str] = None
+    # Move-success verification (see the agent_view handler in
+    # play_session): tracks what region we were in and what we asked to
+    # move to, then checks on the next state update whether it actually
+    # changed. Kept as a standing sanity check even now that the payload
+    # bug is fixed, so a regression shows up immediately instead of
+    # silently again.
     region_before_last_move: Optional[str] = None
-    move_attempts_stuck_count: int = 0  # consecutive moves that didn't change our region
+    last_move_target_region: Optional[str] = None
+    consecutive_failed_moves: int = 0
+    # Explore-repeat guard target, tracked by ruin id independently of
+    # last_decision_kind so an explore -> move -> explore sequence on the
+    # SAME ruin still gets caught even with "move" sitting in between.
+    last_explored_ruin_id: Optional[str] = None
 
 
 async def send_hello(ws, entry_type: str) -> None:
@@ -569,29 +665,35 @@ async def play_session(ws, session: GameSession) -> str:
             visible_monsters = view.get("visibleMonsters") or []
             visible_ruins = view.get("visibleRuins") or []
 
-            # Diagnostic: verify a previously-sent move actually landed.
-            # We compare against the region we were IN before sending that
-            # move (session.region_before_last_move), not against the
-            # target we tried to reach — "stuck in the same region" means
-            # current == previous, regardless of which target we asked for.
-            if (
-                session.last_move_target_region is not None
-                and session.region_before_last_move is not None
-            ):
-                if current_region_id == session.region_before_last_move:
-                    session.move_attempts_stuck_count += 1
-                    if session.move_attempts_stuck_count >= 2:
-                        log_info_block("🚨 MOVE TIDAK BERPENGARUH", {
-                            "percobaan gagal beruntun": session.move_attempts_stuck_count,
-                            "region saat ini": current_region_id,
-                            "target terakhir dikirim": session.last_move_target_region,
-                            "kesimpulan": (
-                                "action 'move' kemungkinan tidak diproses server "
-                                "sebagai perpindahan — field payload mungkin salah"
-                            ),
-                        })
+            # Move-success verification: did currentRegion.id actually
+            # change after we sent a move last turn?
+            if session.last_move_target_region is not None:
+                moved_from = session.region_before_last_move
+                if current_region_id == moved_from:
+                    session.consecutive_failed_moves += 1
+                    log.warning(
+                        "move appears to have FAILED: still in region=%s after "
+                        "requesting move to %s (consecutive_failed_moves=%d)",
+                        moved_from, session.last_move_target_region,
+                        session.consecutive_failed_moves,
+                    )
+                    if session.consecutive_failed_moves >= 3:
+                        log.error(
+                            "move has failed to change region %d turns in a row "
+                            "while stuck in region=%s — dumping full raw view for "
+                            "inspection: %s",
+                            session.consecutive_failed_moves, moved_from,
+                            json.dumps(view, default=str),
+                        )
                 else:
-                    session.move_attempts_stuck_count = 0
+                    if session.consecutive_failed_moves:
+                        log.info(
+                            "move succeeded — region changed %s -> %s after %d "
+                            "failed attempt(s)",
+                            moved_from, current_region_id,
+                            session.consecutive_failed_moves,
+                        )
+                    session.consecutive_failed_moves = 0
                 session.last_move_target_region = None
                 session.region_before_last_move = None
 
@@ -635,12 +737,6 @@ async def play_session(ws, session: GameSession) -> str:
                     "weapon": weapon_name or "(kosong)",
                     **(item_lines or {"item": "(kosong)"}),
                 })
-                # An item id no longer present means the server confirmed
-                # it was consumed (or it's simply gone) — clear it from the
-                # "already healed with this" set so a future item sharing
-                # that id (e.g. a re-stacked pickup) isn't wrongly skipped.
-                current_item_ids = {it.get("id") for it in inventory_items}
-                session.recently_healed_items &= current_item_ids
             # Diagnostic: if HP dropped since the last view and it wasn't
             # from an attack we just sent, dump the ENTIRE raw view so any
             # field we haven't modeled (weather, events, guardian proximity,
@@ -656,7 +752,7 @@ async def play_session(ws, session: GameSession) -> str:
                 and new_hp is not None
                 and (prev_hp - new_hp) >= HP_DROP_DIAGNOSTIC_THRESHOLD
             ):
-                danger_region_id = (view.get("currentRegion") or {}).get("id")
+                danger_region_id = current_region_id
                 if danger_region_id:
                     session.dangerous_regions.add(danger_region_id)
                 log.warning(
@@ -682,7 +778,19 @@ async def play_session(ws, session: GameSession) -> str:
             await maybe_act(ws, session, view)
 
         elif ftype == "action_result":
-            success = frame.get("success", True)
+            # actions.md guarantees "success" is always present on this
+            # frame. Previously this defaulted a missing key to True,
+            # which would have silently treated an unrecognized/malformed
+            # response as a success. Default to False instead — fail
+            # closed, not open — and log loudly if it's ever truly absent.
+            if "success" in frame:
+                success = frame.get("success")
+            else:
+                log.warning(
+                    "action_result frame is missing 'success' entirely — "
+                    "treating as a failure defensively: %s", frame,
+                )
+                success = False
             can_act = frame.get("canAct")
             if can_act is not None:
                 session.can_act = can_act
@@ -776,7 +884,7 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
     # Free actions (talk/whisper) go BEFORE the main action and never
     # consume the turn — placeholder hook, extend with real chat logic
     # if you want the agent to communicate.
-    # await send_free_action(ws, {"type": "action", "action": "whisper", ...})
+    # await send_free_action(ws, {"type": "action", "data": {"type": "whisper", ...}})
 
     if not session.can_act:
         log.debug("canAct is false — waiting for can_act_changed before acting")
@@ -800,46 +908,11 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
 
     decision = decide(working_view)
 
-    if decision.kind == "use_item" and decision.item_id:
-        # Guard against re-sending the same heal every turn if HP is still
-        # below the auto-heal threshold right after using it (e.g. item's
-        # hpRestore was small, or the state update hasn't caught up yet):
-        # only heal once per (item_id) until something else changes.
-        already_used_this_item = (
-            decision.item_id in session.recently_healed_items
-        )
-        if not already_used_this_item:
-            session.recently_healed_items.add(decision.item_id)
-            log_info_block("Aksi (heal - free action)", {
-                "action": "use_item",
-                "item": decision.item_id,
-                "alasan": decision.reason,
-            })
-            heal_payload = build_action_payload(decision)
-            await ws.send(json.dumps(heal_payload))
-            # use_item is free — does not consume the turn, so fall through
-            # and still decide + send a real move/attack/explore below.
-        else:
-            log.debug(
-                "skipping repeat auto-heal on item=%s (already used this "
-                "session without a state refresh) — falling through to "
-                "normal decision",
-                decision.item_id,
-            )
-        # Re-derive the next decision from the working_view as normal —
-        # deliberately NOT re-reading fresh HP here since the server
-        # hasn't confirmed the heal yet; the next agent_view/turn_advanced
-        # frame will carry the real post-heal HP. For this turn we just
-        # move on to whatever the non-heal branches of decide() would do.
-        working_view_post_heal = dict(working_view)
-        working_view_post_heal["self"] = {
-            **self_state,
-            "inventory": [
-                i for i in (self_state.get("inventory") or [])
-                if i.get("id") != decision.item_id
-            ],
-        }
-        decision = decide(working_view_post_heal)
+    # use_item (auto-heal) is a normal cooldown action per actions.md — it
+    # is sent as THIS turn's action via the same path as everything else
+    # below, not as an extra free action followed by a second real action
+    # in the same turn (that assumption was wrong and would have raced
+    # against the server's cooldown).
 
     current_target = (
         decision.ruin_id or decision.target_monster_id or decision.target_agent_id
@@ -876,9 +949,7 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
             log.warning(
                 "redirecting away from attack target=%s (confirmedDead=%s "
                 "noDamageLanded=%s targetHealing=%s prevHp=%s curHp=%s ep=%s) "
-                "— last attack payload sent was targeting this same id; if "
-                "this keeps happening, the attack action may not be landing "
-                "damage at all (payload field names may need adjusting)",
+                "— last attack payload sent was targeting this same id",
                 current_target, target_confirmed_dead, no_damage_landed,
                 target_healing, previously_seen_hp, current_target_hp,
                 self_state.get("ep"),
@@ -899,21 +970,16 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
                 session.last_seen_target_hp[current_target] = current_target_hp
             session.last_action_target = current_target
 
-    # Explore still uses a simple repeat block: ruins don't expose an
-    # HP-style signal to confirm progress, so we can't tell "still working
-    # on it" from "stuck" the way we can for attack. Track by ruin id
-    # directly (not by "was the last action also explore") — a move in
-    # between (even one that got redirected) must not reset this, or the
-    # guard becomes a no-op whenever explore and move alternate, which is
-    # exactly the pattern observed: explore -> move -> explore -> move on
-    # the same ruin for 9+ turns, never blocked because last_decision_kind
-    # was "move" every time this check ran.
+    # Explore uses a ruin-id-based repeat guard: track the ruin we last
+    # tried to explore directly, independent of session.last_decision_kind,
+    # so an explore -> move -> explore sequence on the SAME ruin still
+    # trips the guard even with a move sitting in between.
     elif decision.kind == "explore" and current_target:
         if current_target == session.last_explored_ruin_id:
             session.consecutive_same_target += 1
         else:
             session.consecutive_same_target = 0
-            session.last_explored_ruin_id = current_target
+        session.last_explored_ruin_id = current_target
 
         if session.consecutive_same_target >= 1:
             log.warning(
@@ -931,6 +997,7 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
             else:
                 decision = Decision(kind="wait", reason="breaking repeat loop, no exit")
             session.consecutive_same_target = 0
+            session.last_explored_ruin_id = None
             session.last_action_target = None
         else:
             session.last_action_target = current_target
@@ -941,6 +1008,12 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
         session.consecutive_same_target = 0
 
     session.last_decision_kind = decision.kind
+
+    if decision.kind == "move" and decision.target_region_id:
+        # Record what we're about to attempt so the agent_view handler can
+        # verify next turn whether the region actually changed.
+        session.region_before_last_move = (view.get("currentRegion") or {}).get("id")
+        session.last_move_target_region = decision.target_region_id
 
     payload = build_action_payload(decision)
     target_display = (
@@ -957,10 +1030,6 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
     })
 
     await ws.send(json.dumps(payload))
-
-    if decision.kind == "move" and decision.target_region_id:
-        session.last_move_target_region = decision.target_region_id
-        session.region_before_last_move = (view.get("currentRegion") or {}).get("id")
 
     if is_cooldown_action(decision.kind):
         # Optimistically mark canAct False until the server confirms via
