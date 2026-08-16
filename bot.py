@@ -294,7 +294,7 @@ async def ensure_loadout(rest: RestClient) -> None:
 
 @dataclass
 class Decision:
-    kind: str  # "move" | "attack" | "explore" | "equip" | "wait" | "flee"
+    kind: str  # "move" | "attack" | "explore" | "use_item" | "wait" | "flee"
     target_region_id: Optional[str] = None
     target_agent_id: Optional[str] = None
     target_monster_id: Optional[str] = None
@@ -341,7 +341,33 @@ def decide(view: dict) -> Decision:
                 reason="evacuating death zone",
             )
 
-    # 1.5) Crowded/contested region -> too many visible agents means high
+    # 1.5) Auto-heal: use a recovery item from inventory when HP is low.
+    #    This is a FREE action (doesn't consume the turn per skill.md's
+    #    free-action list) — maybe_act sends this first, then still sends
+    #    a real move/attack/explore afterward this same turn. Checked here,
+    #    right after the death-zone emergency-exit check but BEFORE
+    #    crowded-region and critical-HP retreat: since healing costs
+    #    nothing, there's no downside to healing before also retreating —
+    #    but every check below this one used to `return` unconditionally,
+    #    which made this code unreachable whenever it mattered most. That
+    #    caused the bot to sit at 20/100 HP for 3+ turns while carrying
+    #    unused Emergency Food, since critical-HP retreat kept firing
+    #    first and returning before this ever ran.
+    inventory_items = self_state.get("inventory") or []
+    recovery_items = [i for i in inventory_items if i.get("category") == "recovery"]
+    if hp_ratio < 0.75 and recovery_items:
+        best_item = max(recovery_items, key=lambda i: i.get("hpRestore", 0))
+        if best_item.get("hpRestore", 0) > 0:
+            return Decision(
+                kind="use_item",
+                item_id=best_item.get("id"),
+                reason=(
+                    f"auto-heal: using {best_item.get('name', 'recovery item')} "
+                    f"(hp={hp_ratio:.0%}, restores {best_item.get('hpRestore')})"
+                ),
+            )
+
+    # 1.6) Crowded/contested region -> too many visible agents means high
     #    risk of being attacked from multiple directions at once, even if
     #    our own HP looks fine right now. Observed pattern: large
     #    unexplained HP drops (e.g. 87 -> 58 in one turn) happening in
@@ -364,7 +390,9 @@ def decide(view: dict) -> Decision:
     #    time outranks kills in the current ranking rules. This must fire
     #    regardless of WHY hp is low (agent damage, monster counter-hit,
     #    zone/weather tick) — critical HP always means "get out", not just
-    #    when a hostile agent happens to be visible.
+    #    when a hostile agent happens to be visible. Only reached when we
+    #    have no usable recovery item (the auto-heal branch above would
+    #    have returned already if we did).
     if hp_ratio < 0.40:
         if connections:
             return Decision(
@@ -378,26 +406,7 @@ def decide(view: dict) -> Decision:
                 reason=f"critical HP ({hp_ratio:.0%}) but no connections to flee to",
             )
 
-    # 2.5) Auto-heal: use a recovery item from inventory when HP is
-    #    moderately low. This is a FREE action (doesn't consume the turn
-    #    per skill.md's free-action list), so returning this here doesn't
-    #    block move/attack — maybe_act sends this first, then the normal
-    #    decide() output still gets acted on afterward this same turn.
-    inventory_items = self_state.get("inventory") or []
-    recovery_items = [i for i in inventory_items if i.get("category") == "recovery"]
-    if hp_ratio < 0.75 and recovery_items:
-        best_item = max(recovery_items, key=lambda i: i.get("hpRestore", 0))
-        if best_item.get("hpRestore", 0) > 0:
-            return Decision(
-                kind="equip",
-                item_id=best_item.get("id"),
-                reason=(
-                    f"auto-heal: using {best_item.get('name', 'recovery item')} "
-                    f"(hp={hp_ratio:.0%}, restores {best_item.get('hpRestore')})"
-                ),
-            )
-
-    # 3) Healthy and a weak, isolated target is adjacent -> only then
+    # 4) Healthy and a weak, isolated target is adjacent -> only then
     #    consider a fight. Never chase; only engage what's already here.
     if hp_ratio >= 0.6 and visible_agents:
         non_guardian_targets = [a for a in visible_agents if not a.get("isGuardian")]
@@ -476,7 +485,7 @@ def build_action_payload(decision: Decision) -> dict:
             payload["targetMonsterId"] = decision.target_monster_id
     elif decision.kind == "explore" and decision.ruin_id:
         payload["ruinId"] = decision.ruin_id
-    elif decision.kind == "equip" and decision.item_id:
+    elif decision.kind == "use_item" and decision.item_id:
         payload["itemId"] = decision.item_id
 
     return payload
@@ -751,7 +760,7 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
 
     decision = decide(working_view)
 
-    if decision.kind == "equip" and decision.item_id:
+    if decision.kind == "use_item" and decision.item_id:
         # Guard against re-sending the same heal every turn if HP is still
         # below the auto-heal threshold right after using it (e.g. item's
         # hpRestore was small, or the state update hasn't caught up yet):
@@ -762,13 +771,13 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
         if not already_used_this_item:
             session.recently_healed_items.add(decision.item_id)
             log_info_block("Aksi (heal - free action)", {
-                "action": "equip",
+                "action": "use_item",
                 "item": decision.item_id,
                 "alasan": decision.reason,
             })
             heal_payload = build_action_payload(decision)
             await ws.send(json.dumps(heal_payload))
-            # equip is free — does not consume the turn, so fall through
+            # use_item is free — does not consume the turn, so fall through
             # and still decide + send a real move/attack/explore below.
         else:
             log.debug(
