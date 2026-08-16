@@ -242,7 +242,7 @@ async def ensure_loadout(rest: RestClient) -> None:
 
 
 # --------------------------------------------------------------------------
-# Decision logic (MODE PEMULUNG / SURVIVAL)
+# Decision logic (MODE PEMULUNG SUPER PARANOID)
 # --------------------------------------------------------------------------
 
 @dataclass
@@ -260,7 +260,7 @@ def is_cooldown_action(kind: str) -> bool:
 
 
 def decide(view: dict) -> Decision:
-    """Mode: Scavenger/Pemulung. Fokus loot, jauhi pertarungan, bertahan hidup."""
+    """Mode: Scavenger/Pemulung Paranoid. Fokus loot, jauhi siapapun, bertahan hidup."""
 
     self_state = view.get("self", {}) or {}
     hp = self_state.get("hp", 100)
@@ -288,37 +288,39 @@ def decide(view: dict) -> Decision:
                 reason="evakuasi dari death zone mutlak",
             )
 
-    # 2) MENGHINDARI KERUMUNAN (Tingkat toleransi diturunkan jadi 5)
-    CROWDED_THRESHOLD = 5
+    # 2) MENGHINDARI PLAYER LAIN (Sangat Paranoid / Anti-Sosial)
+    # Kalau ada 2 orang atau lebih di satu area, LANGSUNG KABUR!
+    CROWDED_THRESHOLD = 1
     if len(visible_agents) > CROWDED_THRESHOLD and connections:
         return Decision(
             kind="move",
             target_region_id=random.choice(connections),
             reason=(
-                f"keramaian terdeteksi ({len(visible_agents)} agents) — "
-                "terlalu bahaya untuk akun tanpa equip, menghindar!"
+                f"ada player lain ({len(visible_agents)} agents) — "
+                "terlalu bahaya untuk akun tanpa equip, langsung kabur!"
             ),
         )
 
-    # 3) KABUR KALAU HP KURANG DARI 50% (Sangat hati-hati)
-    if hp_ratio < 0.50:
+    # 3) KABUR KALAU KENA HIT (HP di bawah 90%)
+    # Jangan tunggu HP 50%. Kesenggol dikit langsung lari!
+    if hp_ratio < 0.90:
         if connections:
             return Decision(
                 kind="move",
                 target_region_id=random.choice(connections),
-                reason=f"HP mulai tipis ({hp_ratio:.0%}) — mundur dari bahaya",
+                reason=f"HP berkurang ({hp_ratio:.0%}) — mundur mencari aman!",
             )
         else:
             return Decision(
                 kind="wait",
-                reason=f"HP tipis ({hp_ratio:.0%}) tapi terjebak (tidak ada jalan)",
+                reason=f"HP kritis ({hp_ratio:.0%}) tapi tidak ada jalan kabur",
             )
 
     # 4) PRIORITAS NGE-LOOT (Mulung Ruin)
     alert_active = self_state.get("alertActive", False)
     alert_gauge = self_state.get("alertGauge", 0) or 0
-    # Berani nge-loot selama HP di atas 60% dan alert masih aman
-    if visible_ruins and not alert_active and alert_gauge <= 4 and hp_ratio >= 0.6:
+    # Berani nge-loot selama HP aman dan alert gauge rendah
+    if visible_ruins and not alert_active and alert_gauge <= 4:
         ruin = next((r for r in visible_ruins if not r.get("isEmpty")), None)
         if ruin:
             return Decision(
@@ -328,7 +330,7 @@ def decide(view: dict) -> Decision:
             )
 
     # 5) NYERANG AGENT HANYA JIKA MEREKA SANGAT SEKARAT (Numpang Nyampah)
-    if hp_ratio >= 0.7 and visible_agents:
+    if visible_agents:
         non_guardian_targets = [a for a in visible_agents if not a.get("isGuardian")]
         if non_guardian_targets:
             weakest = min(
@@ -344,7 +346,7 @@ def decide(view: dict) -> Decision:
                 )
 
     # 6) MONSTER TERLEMAH SAJA YANG DISERANG
-    if hp_ratio >= 0.7 and visible_monsters and ep > 0:
+    if visible_monsters and ep > 0:
         weakest_monster = min(visible_monsters, key=lambda m: m.get("hp", 999))
         if weakest_monster.get("hp", 999) < 25:
             return Decision(
@@ -707,7 +709,7 @@ async def run_one_game(rest: RestClient, entry_type: str) -> str:
     join_started_at = time.monotonic()
 
     try:
-        # Kita menggunakan additional_headers yang sudah diperbaiki sebelumnya
+        # Menggunakan additional_headers untuk websockets
         async with websockets.connect(
             WS_JOIN_URL, additional_headers=headers, ping_interval=20, ping_timeout=20
         ) as ws:
