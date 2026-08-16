@@ -58,9 +58,8 @@ def log_info_block(title: str, fields: dict) -> None:
 
 
 # --------------------------------------------------------------------------
-# REST client (Tetap sama seperti aslinya)
+# REST client
 # --------------------------------------------------------------------------
-# [BAGIAN REST CLIENT SAMA PERSIS SEPERTI SEBELUMNYA]
 
 class ApiError(Exception):
     def __init__(self, status: int, code: str, message: str):
@@ -134,10 +133,11 @@ class RestClient:
 
 
 async def ensure_loadout(rest: RestClient) -> None:
-    # [LOGIKA LOADOUT SAMA PERSIS SEPERTI SEBELUMNYA]
     try: loadout = (await rest.get_loadout()).get("data", {})
     except ApiError: return
+    
     if loadout.get("fullSet"): return
+    
     try:
         packs = await rest.get_inventory_packs()
         relics = await rest.get_inventory_relics()
@@ -203,7 +203,6 @@ def decide_free_actions(view: dict) -> list[Decision]:
             ))
 
     # 2. AUTO-PICKUP: Jika ada barang nganggur di map, otomatis ambil.
-    # Tergantung versi server, item bisa di view["visibleItems"] atau view["currentRegion"]["items"]
     visible_items = view.get("visibleItems") or []
     if not visible_items:
         current_region = view.get("currentRegion") or {}
@@ -367,7 +366,6 @@ class GameSession:
     consecutive_failed_moves: int = 0
     last_explored_ruin_id: Optional[str] = None
 
-# [FUNGSI get_target_current_hp SAMA PERSIS]
 def get_target_current_hp(view: dict, target_id: str) -> Optional[int]:
     for a in (view.get("visibleAgents") or []):
         if a.get("id") == target_id: return a.get("hp")
@@ -391,7 +389,6 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
     hp = self_state.get("hp")
 
     # ----- PROSES FREE ACTIONS DULU (Pickup, Equip, dll) -----
-    # Mengeksekusi dan mengirim payload action yang tidak makan turn / cooldown
     free_actions = decide_free_actions(view)
     for fd in free_actions:
         payload = build_action_payload(fd)
@@ -401,7 +398,7 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
             "alasan": fd.reason
         })
         await ws.send(json.dumps(payload))
-        await asyncio.sleep(0.3)  # Delay kecil agar tidak spam websocket terlalu brutal
+        await asyncio.sleep(0.3)  # Delay kecil agar tidak spam websocket
 
     # ----- PROSES MAIN ACTION (Cooldown Group) -----
     if not session.can_act:
@@ -485,7 +482,6 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
         session.can_act = False
 
 async def play_session(ws, session: GameSession) -> str:
-    # [LOOP INI TETAP SAMA PERSIS SEPERTI SEBELUMNYA. HANYA MENYEBUT maybe_act SAAT DIPERLUKAN]
     async for raw in ws:
         try:
             frame = json.loads(raw)
@@ -502,11 +498,60 @@ async def play_session(ws, session: GameSession) -> str:
             log_info_block("Masuk Room", {"room/game id": session.game_id, "entry type": session.entry_type})
         elif ftype in ("agent_view", "turn_advanced", "handover_sync", "action_rejected"):
             view = frame.get("view", {})
+            
+            if ftype != "action_rejected":
+                current_region = view.get("currentRegion", {}) or {}
+                current_region_id = current_region.get("id")
+                new_self = view.get("self") or {}
+                new_hp = new_self.get("hp")
+                new_max_hp = new_self.get("maxHp")
+                visible_agents = view.get("visibleAgents") or []
+                visible_monsters = view.get("visibleMonsters") or []
+                visible_ruins = view.get("visibleRuins") or []
+                
+                if session.last_move_target_region is not None:
+                    moved_from = session.region_before_last_move
+                    if current_region_id == moved_from:
+                        session.consecutive_failed_moves += 1
+                        if session.consecutive_failed_moves >= 3:
+                            pass # Hanya untuk menekan spam log
+                    else:
+                        session.consecutive_failed_moves = 0
+                    session.last_move_target_region = None
+                    session.region_before_last_move = None
+                
+                hp_display = f"{new_hp}/{new_max_hp}" if new_max_hp else str(new_hp)
+                reason = frame.get("reason")
+                
+                log_info_block("Status", {
+                    "turn": frame.get("turn"),
+                    "hp": hp_display,
+                    "ep": new_self.get("ep"),
+                    "bisa aksi": session.can_act,
+                    "posisi (region)": current_region_id,
+                    "death zone": current_region.get("isDeathZone"),
+                    "musuh terlihat": len(visible_agents) or None,
+                    "monster terlihat": len(visible_monsters) or None,
+                    "ruin terlihat": len(visible_ruins) or None,
+                    "update type": f"{ftype} ({reason})" if reason else ftype,
+                })
+                
+                equipped_weapon = new_self.get("equippedWeapon")
+                inventory_items = new_self.get("inventory") or []
+                equip_signature = json.dumps({"weapon": equipped_weapon, "inventory": inventory_items}, sort_keys=True)
+                
+                if equip_signature != session.last_equipment_signature:
+                    session.last_equipment_signature = equip_signature
+                    item_lines = {it.get("name", f"item {i}"): f"x{it.get('quantity', 1)}" for i, it in enumerate(inventory_items)}
+                    weapon_name = equipped_weapon.get("name") if isinstance(equipped_weapon, dict) else equipped_weapon
+                    log_info_block("Equipment", {
+                        "weapon": weapon_name or "(kosong)",
+                        **(item_lines or {"item": "(kosong)"}),
+                    })
+
             session.last_view = view
             session.last_view_turn = frame.get("turn")
-            if ftype != "action_rejected":
-                # Validasi pindah sukses dan diagnosa HP ditaruh di sini sama seperti aslinya...
-                pass
+            
             await maybe_act(ws, session, view)
 
         elif ftype == "action_result":
@@ -551,5 +596,129 @@ async def play_session(ws, session: GameSession) -> str:
 
     return "closed"
 
-# [BAGIAN RUN_ONE_GAME, CHOOSE_ENTRY_TYPE, DAN MAIN_LOOP SAMA PERSIS SEPERTI SEBELUMNYA]
-# Pastikan tidak ada indentasi yang terpotong saat kamu menyalin.
+async def run_one_game(rest: RestClient, entry_type: str) -> str:
+    headers = {
+        "X-API-Key": rest.api_key,
+        "X-Version": rest.version,
+    }
+
+    join_started_at = time.monotonic()
+
+    try:
+        async with websockets.connect(
+            WS_JOIN_URL, additional_headers=headers, ping_interval=20, ping_timeout=20
+        ) as ws:
+            welcome_raw = await ws.recv()
+            welcome = json.loads(welcome_raw)
+
+            if welcome.get("type") == "welcome":
+                decision = welcome.get("decision")
+                if decision == "BLOCKED":
+                    return "blocked"
+
+            await send_hello(ws, entry_type)
+            session = GameSession(entry_type=entry_type)
+            outcome = await play_session(ws, session)
+            return outcome
+
+    except ConnectionClosed as e:
+        if e.code == 1013: return "resume_dead"
+        if e.code == 4032: return "died"
+        return "closed"
+
+async def choose_entry_type(rest: RestClient) -> Optional[str]:
+    me = await rest.get_me()
+    readiness = me.get("readiness", {}) or {}
+    current_games = me.get("currentGames", []) or []
+
+    def live(entry: str) -> bool:
+        return any(
+            g.get("entryType") == entry
+            and g.get("isAlive")
+            and g.get("gameStatus") != "finished"
+            for g in current_games
+        )
+
+    free_live = live("free")
+    paid_live = live("paid")
+
+    if ENTRY_TYPE_PREFERENCE == "paid":
+        if paid_live or readiness.get("paidReady"): return "paid"
+        return "free"
+
+    if ENTRY_TYPE_PREFERENCE == "free":
+        return "free"
+
+    if paid_live: return "paid"
+    if free_live: return "free"
+    if readiness.get("paidReady"): return "paid"
+    return "free"
+
+
+async def main_loop() -> None:
+    if not API_KEY:
+        log.error("CLAW_API_KEY is not set — see .env.example")
+        sys.exit(1)
+
+    stop = asyncio.Event()
+
+    def _handle_signal(*_args):
+        log.info("shutdown signal received")
+        stop.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try: loop.add_signal_handler(sig, _handle_signal)
+        except NotImplementedError: pass
+
+    async with RestClient(API_KEY) as rest:
+        await rest.fetch_version()
+        try:
+            me = await rest.get_me()
+            readiness = me.get("readiness", {}) or {}
+            log_info_block("Akun", {
+                "nama": me.get("name"),
+                "balance": f"{me.get('balance')} sMoltz",
+                "wallet ok": readiness.get("walletAddress"),
+                "whitelist": readiness.get("whitelistApproved"),
+                "sMoltz cukup": readiness.get("sMoltzSufficient"),
+                "paid ready": readiness.get("paidReady"),
+            })
+        except ApiError as e:
+            log.error("could not fetch account — check CLAW_API_KEY: %s", e)
+            sys.exit(1)
+
+        reconnect_delay = RECONNECT_MIN_DELAY
+
+        while not stop.is_set():
+            try:
+                entry_type = await choose_entry_type(rest)
+                if entry_type is None:
+                    await asyncio.sleep(STATE_POLL_INTERVAL)
+                    continue
+
+                await ensure_loadout(rest)
+                outcome = await run_one_game(rest, entry_type)
+
+                if outcome in ("died", "ended", "resume_dead"):
+                    reconnect_delay = RECONNECT_MIN_DELAY
+                    await asyncio.sleep(INTER_GAME_DELAY)
+                elif outcome == "blocked":
+                    await asyncio.sleep(STATE_POLL_INTERVAL)
+                else:
+                    await asyncio.sleep(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
+
+            except ApiError:
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
+            except (ConnectionClosed, OSError):
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
+            except Exception:
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
+
+
+if __name__ == "__main__":
+    asyncio.run(main_loop())
