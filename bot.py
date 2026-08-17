@@ -23,7 +23,7 @@ Diselaraskan dengan skill.md (v1.15.0) + openapi.yaml resmi:
     OFF) auto-beli material murah di marketplace.
 
 (Mode Barbar + Dashboard UI + Kill Counter + Smart Weapon Range +
- Fast DZ Escape + Inventory Tracker + Economy Manager)
+ Fast DZ Escape + Inventory Tracker + Economy Manager + Rat Mode)
 """
 
 from __future__ import annotations
@@ -105,13 +105,15 @@ class SlotState:
         self.enabled = True
 
         self.game_id = "Idle"
+        self.turn = 0             # <-- TAMBAHAN BARU
+        self.alive_players = "?"  # <-- TAMBAHAN BARU
         self.kills = 0
         self.hp = "N/A"
         self.ep = "N/A"
         self.region = "N/A"
         self.is_dz = False
-        self.weapon = "(Kosong)"
-        self.armor = "(Kosong)"
+        self.weapon = "Kosong"
+        self.armor = "Kosong"
         self.inventory: list[str] = []
         self.enemies = 0
         self.monsters = 0
@@ -122,16 +124,16 @@ class SlotState:
         self.reason = "Standby"
 
     def block(self) -> str:
-        dz_warn = "⚠️ BAHAYA!" if self.is_dz else "✅ Aman"
-        inv_text = ", ".join(self.inventory[:5]) if self.inventory else "(Tas Kosong)"
+        dz_warn = "⚠️ BAHAYA!" if self.is_dz else "✅ AMAN"
+        inv_text = ", ".join(self.inventory[:5]) if self.inventory else "Tas Kosong"
         if len(self.inventory) > 5:
             inv_text += f" (+{len(self.inventory) - 5} lagi)"
         return (
-            f"  Room      : {self.game_id}\n"
+            f"  Room      : {self.game_id} (Turn: {self.turn} | Sisa Agent: {self.alive_players})\n"
             f"  Kills     : 💀 {self.kills}    HP: {self.hp}    EP: {self.ep}\n"
             f"  Posisi    : {self.region}   [{dz_warn}]\n"
             f"  Equipment : Senjata={self.weapon} | Armor={self.armor}\n"
-            f"  Radar     : {self.enemies} Agent, {self.monsters} Monster, {self.loot} Loot\n"
+            f"  Radar     : {self.enemies} Musuh, {self.monsters} Monster, {self.loot} Loot\n"
             f"  Tas       : {inv_text}\n"
             f"  Aksi      : {self.last_action}  [{self.action_status}]\n"
             f"  Alasan    : {self.reason}\n"
@@ -168,18 +170,18 @@ class Dashboard:
 
         parts = ["\033[2J\033[H"]
         parts.append("=========================================================\n")
-        parts.append(" 🤖 CLAW ROYALE BOT - DASHBOARD (MODE BARBAR)\n")
+        parts.append(" CLAW ROYALE BOT - DASHBOARD \n")
         parts.append("=========================================================\n")
-        parts.append("[ 👤 AKUN ]\n")
+        parts.append("=== AKUN ===\n")
         parts.append(f"  Nama: {self.acc_name}   Balance: {self.acc_balance}   Wallet: {self.acc_wallet}\n\n")
-        parts.append("[ 💰 EKONOMI ]\n")
+        parts.append("=== EKONOMI ===\n")
         parts.append(f"  Pack Pity: {self.pack_pity}    Material Pity: {self.material_pity}\n")
         parts.append(f"  Aksi Terakhir: {self.last_shop_action}\n\n")
 
         for slot in self.slots.values():
             if not slot.enabled:
                 continue
-            parts.append(f"[ 🎮 SLOT {slot.label} ]\n")
+            parts.append(f"=== SLOT {slot.label} ===\n")
             parts.append(slot.block())
             parts.append("\n")
 
@@ -420,10 +422,10 @@ async def _run_redeem_welcome(rest: RestClient) -> None:
         res = await rest.redeem("WELCOME")
         data = res.get("data", res)
         if data.get("replayed"):
-            dash.last_shop_action = "🎁 Kode WELCOME sudah pernah diklaim sebelumnya."
+            dash.last_shop_action = "Kode WELCOME sudah pernah diklaim sebelumnya."
         else:
             n = len(data.get("items", []) or [])
-            dash.last_shop_action = f"🎁 Redeem WELCOME sukses ({n} item didapat)!"
+            dash.last_shop_action = f"Redeem WELCOME sukses ({n} item didapat)!"
     except ApiError as e:
         # Kalau memang tidak eligible/sudah pernah, biarkan lewat — bukan fatal.
         log.warning("Redeem WELCOME gagal: %s", e)
@@ -578,7 +580,7 @@ async def _auto_marketplace(rest: RestClient) -> None:
         try:
             idem = str(uuid.uuid4())
             await rest.marketplace_buy(listing["id"], quantity=1, idempotency_key=idem)
-            dash.last_shop_action = f"🤝 Beli material di marketplace seharga {price:.0f} sMoltz"
+            dash.last_shop_action = f"Beli material di marketplace seharga {price:.0f} sMoltz"
             dash.render(force=True)
         except ApiError as e:
             log.warning("Marketplace buy gagal: %s", e)
@@ -628,7 +630,7 @@ class Decision:
 
 
 def is_cooldown_action(kind: str) -> bool:
-    return kind in {"move", "attack", "explore", "use_item", "interact", "wait", "rest"}
+    return kind in {"move", "attack", "explore", "use_item", "interact", "wait", "rest", "drop"}
 
 
 def _get_weapon_range(w: dict) -> float:
@@ -712,7 +714,7 @@ def decide_free_actions(view: dict) -> list[Decision]:
             free_decisions.append(Decision(
                 kind="equip",
                 item_id=best_weapon.get("id"),
-                reason=f"Switch Senjata ({w_type}, jarak musuh~{target_distance}): {best_weapon.get('name')}"
+                reason=f"Ganti Senjata ({w_type}, jarak musuh~{target_distance}): {best_weapon.get('name')}"
             ))
             self_state["equippedWeapon"] = best_weapon
 
@@ -764,9 +766,30 @@ def decide_free_actions(view: dict) -> list[Decision]:
             free_decisions.append(Decision(
                 kind="pickup",
                 item_id=item_id,
-                reason=f"⚡ FAST LOOT: Ambil {item.get('name', 'Item')}"
+                reason=f"Ambil {item.get('name', 'Item')}"
             ))
             inv_count += 1
+
+    # ---------------------------------------------------------
+    # 4. SMART INVENTORY MANAGEMENT (Buang Junk)
+    # ---------------------------------------------------------
+    if len(inventory) >= 10:
+        equipped_ids = set()
+        if isinstance(equipped_weapon, dict): equipped_ids.add(equipped_weapon.get("id"))
+        elif isinstance(equipped_weapon, str): equipped_ids.add(equipped_weapon)
+        if isinstance(equipped_armor, dict): equipped_ids.add(equipped_armor.get("id"))
+        elif isinstance(equipped_armor, str): equipped_ids.add(equipped_armor)
+
+        bag_items = [i for i in inventory if i.get("id") not in equipped_ids]
+        junk_items = [i for i in bag_items if i.get("category") == "junk"]
+        
+        if junk_items:
+            item_to_drop = junk_items[0]
+            free_decisions.append(Decision(
+                kind="drop",
+                item_id=item_to_drop.get("id"),
+                reason=f"Tas Penuh: Buang {item_to_drop.get('name')}."
+            ))
 
     return free_decisions
 
@@ -801,7 +824,7 @@ def decide(view: dict, session: "GameSession") -> Decision:
         facilities = view.get("visibleFacilities") or current_region.get("facilities") or current_region.get("interactables") or []
         if facilities:
             return Decision(kind="interact", interactable_id=facilities[0].get("id"), reason="🚪 Keluar dari Gua (Cave) dulu — move diblokir selagi di gua.")
-        return Decision(kind="interact", reason="🚪 Mencoba keluar dari Gua (Cave).")
+        return Decision(kind="interact", reason="🚪 Mencoba keluar dari Gua.")
 
     # ---------------------------------------------------------
     # 1. SURVIVAL & RECOVERY
@@ -814,15 +837,15 @@ def decide(view: dict, session: "GameSession") -> Decision:
         if safe_targets:
             really_safe = [c for c in safe_targets if c not in session.dangerous_regions]
             chosen = random.choice(really_safe) if really_safe else random.choice(safe_targets)
-            return Decision(kind="move", target_region_id=chosen, reason="🚨 KABUR CEPAT DARI DEATH ZONE!")
+            return Decision(kind="move", target_region_id=chosen, reason="ZONA BERBAHAYA, KABUR!")
         elif connections:
-            return Decision(kind="move", target_region_id=random.choice(connections), reason="🚨 KABUR DARURAT! (Semua zona bahaya)")
+            return Decision(kind="move", target_region_id=random.choice(connections), reason="KABUR DARURAT!")
 
     # 1.2) EARLY AUTO-HEAL (Naik ke 85%)
     if hp_ratio < 0.85 and recovery_items:
         best_hp_item = max(recovery_items, key=lambda i: i.get("hpRestore", 0))
         if best_hp_item.get("hpRestore", 0) > 0:
-            return Decision(kind="use_item", item_id=best_hp_item.get("id"), reason=f"💊 Auto-Heal Dini: Pakai {best_hp_item.get('name')}")
+            return Decision(kind="use_item", item_id=best_hp_item.get("id"), reason=f"Heal Pakai {best_hp_item.get('name')}")
 
     # 1.3) Critical HP + No Potions -> Hard Retreat
     if hp_ratio < 0.25:
@@ -836,46 +859,53 @@ def decide(view: dict, session: "GameSession") -> Decision:
             return i.get("epRestore", 0) or i.get("spRestore", 0) or i.get("energyRestore", 0) or 0
         best_ep_item = max(recovery_items, key=ep_score)
         if ep_score(best_ep_item) > 0:
-            return Decision(kind="use_item", item_id=best_ep_item.get("id"), reason=f"🔋 Isi Stamina: Pakai {best_ep_item.get('name')}")
+            return Decision(kind="use_item", item_id=best_ep_item.get("id"), reason=f"Isi Stamina Pakai {best_ep_item.get('name')}")
 
     # 1.5) Hindari Kerumunan Massal (>12 orang)
     if len(visible_agents) > 12 and connections:
-        return Decision(kind="move", target_region_id=random.choice(connections), reason="⚠️ Terlalu ramai (>12 agent), Reposisi!")
+        return Decision(kind="move", target_region_id=random.choice(connections), reason="Terlalu ramai, Reposisi!")
 
     # ---------------------------------------------------------
-    # 2. FIGHT — lebih hati-hati dari sebelumnya.
-    #    Ranking sekarang: alive > SURVIVAL TIME > kills > EP terpakai.
-    #    HP akhir TIDAK dihitung sama sekali. Artinya bertahan 1 turn lebih
-    #    lama > dapat 1 kill tambahan — jadi cuma ambil fight yang jelas
-    #    menguntungkan (margin HP musuh dipersempit) dan syarat HP diri
-    #    dinaikkan supaya tidak gambling nyawa demi kill.
+    # 2. FIGHT — MODE RAT/SURVIVAL (Prioritas Bertahan Hidup)
     # ---------------------------------------------------------
     if visible_agents and ep > 0:
         non_guardian = [a for a in visible_agents if not a.get("isGuardian")]
-        winnable = [a for a in non_guardian if a.get("hp", 999) <= hp * 1.15]
-        pool = winnable or non_guardian
-        if pool and hp_ratio >= 0.60:
-            weakest = min(pool, key=lambda a: a.get("hp", 999))
-            return Decision(kind="attack", target_agent_id=weakest.get("id"), reason="⚔️ SERANG! Menghajar Agent terlemah (fight yang jelas menguntungkan).")
+        
+        # PRIORITAS 1: NYAMPAH (Kill Steal). Cuma serang kalau HP musuh <= 20%
+        dying_enemies = [a for a in non_guardian if a.get("hp", 999) <= max_hp_guess * 0.20]
+        if dying_enemies:
+            weakest_dying = min(dying_enemies, key=lambda a: a.get("hp", 999))
+            return Decision(kind="attack", target_agent_id=weakest_dying.get("id"), reason="Nyampah agent sekarat!")
 
-    if visible_monsters and ep > 0 and hp_ratio >= 0.45:
+        # PRIORITAS 2: KABUR! Kalau ada player sehat, jangan ladenin. Biarin mereka baku hantam.
+        if connections:
+            safe_routes = [c for c in connections if c not in session.dangerous_regions]
+            chosen_route = random.choice(safe_routes) if safe_routes else random.choice(connections)
+            return Decision(kind="move", target_region_id=chosen_route, reason="Ada player HP Jos, mending pindah aman!")
+
+    # Cuma hunting monster kalau HP kita > 70% biar nggak gampang dibokong player lain.
+    if visible_monsters and ep > 0 and hp_ratio >= 0.70:
         weakest_monster = min(visible_monsters, key=lambda m: m.get("hp", 999))
-        return Decision(kind="attack", target_monster_id=weakest_monster.get("id"), reason="⚔️ SERANG! Menghabisi Monster untuk loot.")
+        return Decision(kind="attack", target_monster_id=weakest_monster.get("id"), reason="Aman, hunting monster.")
 
     # ---------------------------------------------------------
-    # 3. INTERAKSI & EKSPLORASI
+    # 3. INTERAKSI & EKSPLORASI CERDAS
     # ---------------------------------------------------------
     alert_active = self_state.get("alertActive", False)
     alert_gauge = self_state.get("alertGauge", 0) or 0
-    if visible_ruins and not alert_active and alert_gauge <= 6:
+    # Stop explore kalau alert udah mulai merah (maksimal 3 biar ga dipanggil guardian)
+    if visible_ruins and not alert_active and alert_gauge <= 3:
         ruin = next((r for r in visible_ruins if not r.get("isEmpty")), None)
         if ruin:
             return Decision(kind="explore", ruin_id=ruin.get("ruinId"), reason=f"Eksplorasi Ruin (Alert: {alert_gauge})")
 
     if connections:
-        return Decision(kind="move", target_region_id=random.choice(connections), reason="Hunting: Mencari musuh di region lain.")
+        safe_connections = [c for c in connections if c not in session.dangerous_regions]
+        if safe_connections:
+            return Decision(kind="move", target_region_id=random.choice(safe_connections), reason="Pindah ke zona aman.")
+        return Decision(kind="move", target_region_id=random.choice(connections), reason="Pindah Semua map berisiko.")
 
-    return Decision(kind="wait", reason="Standby, tidak ada aksi tersedia.")
+    return Decision(kind="wait", reason="Standby nunggu energi penuh.")
 
 
 def build_action_payload(decision: Decision) -> dict:
@@ -897,6 +927,8 @@ def build_action_payload(decision: Decision) -> dict:
             data["interactableId"] = decision.interactable_id
     elif decision.kind == "pickup" and decision.item_id:
         data = {"type": "pickup", "itemId": decision.item_id}
+    elif decision.kind == "drop" and decision.item_id:
+        data = {"type": "drop", "itemId": decision.item_id}
     elif decision.kind == "equip" and decision.item_id:
         data = {"type": "equip", "itemId": decision.item_id}
     elif decision.kind == "talk" and decision.message:
@@ -971,6 +1003,11 @@ def _is_in_danger(view: dict) -> bool:
 async def update_dashboard_state(view: dict, slot: SlotState) -> None:
     """Memperbarui variabel dashboard (slot free/paid) agar sinkron dengan data server"""
     self_state = view.get("self", {}) or {}
+    
+    # === Info Dashboard Baru ===
+    slot.turn = view.get("turn", slot.turn)
+    slot.alive_players = view.get("aliveAgents", "?") 
+    # ===========================
 
     slot.hp = f"{self_state.get('hp', 0)}/{self_state.get('maxHp', 0)}"
     slot.ep = str(self_state.get("ep", 0))
@@ -1026,12 +1063,12 @@ async def maybe_act(ws, session: GameSession, view: dict, slot: SlotState) -> No
                 payload = build_action_payload(fd)
                 slot.last_action = fd.kind.upper()
                 slot.reason = fd.reason
-                slot.action_status = "Terkirim (No Cooldown)"
+                slot.action_status = "Terkirim => Tanpa cooldown"
                 dash.render()
                 await ws.send(json.dumps(payload))
                 await asyncio.sleep(0.01)
         else:
-            slot.reason = "🚨 BAHAYA! Skip looting/equip, prioritas KABUR..."
+            slot.reason = "BAHAYA! Skip looting/equip, prioritas KABUR..."
             dash.render()
 
         if not session.can_act:
@@ -1054,7 +1091,7 @@ async def maybe_act(ws, session: GameSession, view: dict, slot: SlotState) -> No
             if target_confirmed_dead or no_damage_landed or target_healing:
                 connections = (view.get("currentRegion") or {}).get("connections") or []
                 if connections:
-                    decision = Decision(kind="move", target_region_id=random.choice(connections), reason="Redirect (Target Stuck/Mati)")
+                    decision = Decision(kind="move", target_region_id=random.choice(connections), reason="Redirect target mati/stuck.")
                 else:
                     decision = Decision(kind="wait", reason="Target mati/stuck tapi tidak ada jalan.")
                 current_target = None
@@ -1094,7 +1131,7 @@ async def maybe_act(ws, session: GameSession, view: dict, slot: SlotState) -> No
 
         slot.last_action = decision.kind.upper()
         slot.reason = decision.reason
-        slot.action_status = "Terkirim (Cooldown)"
+        slot.action_status = "Terkirim => Cooldown"
         dash.render()
 
         await ws.send(json.dumps(payload))
