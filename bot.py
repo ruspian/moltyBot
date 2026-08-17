@@ -1,7 +1,29 @@
 #!/usr/bin/env python3
 """
 Claw Royale agent bot.
-(Mode Barbar + Dashboard UI + Kill Counter + Smart Weapon Range + Fast DZ Escape + Inventory Tracker)
+
+Diselaraskan dengan skill.md (v1.15.0) + openapi.yaml resmi:
+  - Death detection pakai agent_died.meta.youDied (BUKAN agentId, karena
+    field itu self-token per-game, bukan uuid asli — lihat Core Rule 18).
+  - action_rejected ditangani sama seperti agent_view/turn_advanced.
+  - Error TARGET_DEAD (bukan AGENT_DEAD) dipakai buat "target sudah mati,
+    ganti target di turn yang sama" — turn TIDAK habis (canAct: true).
+  - Move ditolak total selagi inCave (canAct tetap true) -> exit cave
+    (interact) diprioritaskan paling atas.
+  - Ranking sekarang: alive > survival time DESC > kills DESC > EP ASC.
+    HP akhir TIDAK lagi dihitung -> strategi digeser: lebih hati-hati soal
+    fight, jangan korbankan waktu hidup demi 1 kill tambahan.
+  - Resume ke game yang agent-nya sudah mati akan ditolak (4032 / 1013
+    RESUME_TARGET_DEAD) -> re-dial /ws/join sekali, jangan retry-storm.
+  - Slot FREE dan PAID itu independen (bisa jalan bersamaan) -> bot ini
+    menjalankan keduanya sebagai dua loop terpisah secara default.
+  - Fitur ekonomi baru: auto-redeem kode WELCOME, auto-belanja shop
+    (pack ticket / material reforge), auto-reforge relic nganggur, cek
+    notifikasi (mis. marketplace_sale_completed), dan (opsional, default
+    OFF) auto-beli material murah di marketplace.
+
+(Mode Barbar + Dashboard UI + Kill Counter + Smart Weapon Range +
+ Fast DZ Escape + Inventory Tracker + Economy Manager)
 """
 
 from __future__ import annotations
@@ -14,6 +36,7 @@ import random
 import signal
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -31,7 +54,11 @@ REST_BASE = f"https://{BASE_HOST}/api"
 WS_JOIN_URL = f"wss://{BASE_HOST}/ws/join"
 WS_AGENT_URL = f"wss://{BASE_HOST}/ws/agent"
 
+# "auto" = jalankan slot FREE dan PAID bersamaan (keduanya independen — lihat
+# skill.md § State Router). Set "free" atau "paid" untuk cuma jalankan satu.
 ENTRY_TYPE_PREFERENCE = os.environ.get("CLAW_ENTRY_TYPE", "auto").strip().lower()
+RUN_FREE = ENTRY_TYPE_PREFERENCE in ("auto", "free")
+RUN_PAID = ENTRY_TYPE_PREFERENCE in ("auto", "paid")
 
 # Matikan log default INFO agar tidak merusak tampilan Dashboard
 LOG_LEVEL = os.environ.get("CLAW_LOG_LEVEL", "WARNING").upper()
@@ -39,6 +66,18 @@ STATE_POLL_INTERVAL = float(os.environ.get("CLAW_STATE_POLL_INTERVAL", "5"))
 RECONNECT_MIN_DELAY = float(os.environ.get("CLAW_RECONNECT_MIN_DELAY", "1"))
 RECONNECT_MAX_DELAY = float(os.environ.get("CLAW_RECONNECT_MAX_DELAY", "30"))
 INTER_GAME_DELAY = float(os.environ.get("CLAW_INTER_GAME_DELAY", "3"))
+
+# --- Fitur ekonomi (belanja/reforge/marketplace otomatis) -----------------
+CLAW_AUTO_REDEEM_WELCOME = os.environ.get("CLAW_AUTO_REDEEM_WELCOME", "true").strip().lower() == "true"
+CLAW_AUTO_SHOP = os.environ.get("CLAW_AUTO_SHOP", "true").strip().lower() == "true"
+CLAW_SHOP_MIN_RESERVE = float(os.environ.get("CLAW_SHOP_MIN_RESERVE", "500"))
+CLAW_SHOP_MAX_SPEND_PER_CYCLE = float(os.environ.get("CLAW_SHOP_MAX_SPEND_PER_CYCLE", "2000"))
+CLAW_AUTO_REFORGE = os.environ.get("CLAW_AUTO_REFORGE", "true").strip().lower() == "true"
+# Marketplace = transaksi dengan pemain lain -> default OFF biar aman, aktifkan
+# manual lewat env kalau memang mau bot belanja di marketplace juga.
+CLAW_AUTO_MARKETPLACE = os.environ.get("CLAW_AUTO_MARKETPLACE", "false").strip().lower() == "true"
+CLAW_MARKET_MAX_MATERIAL_PRICE = float(os.environ.get("CLAW_MARKET_MAX_MATERIAL_PRICE", "1500"))
+CLAW_ECONOMY_INTERVAL = float(os.environ.get("CLAW_ECONOMY_INTERVAL", "60"))
 
 # File terpisah untuk log error, supaya tidak merusak layar Dashboard (yang pakai stdout).
 # Default ke /tmp karena direktori kerja/app di banyak container bersifat read-only.
@@ -55,8 +94,49 @@ log = logging.getLogger("clawroyale")
 
 
 # --------------------------------------------------------------------------
-# DASHBOARD UI SYSTEM
+# DASHBOARD UI SYSTEM (mendukung slot FREE + PAID berjalan bersamaan)
 # --------------------------------------------------------------------------
+
+class SlotState:
+    """Status tampilan untuk satu slot game (free ATAU paid)."""
+
+    def __init__(self, label: str):
+        self.label = label
+        self.enabled = True
+
+        self.game_id = "Idle"
+        self.kills = 0
+        self.hp = "N/A"
+        self.ep = "N/A"
+        self.region = "N/A"
+        self.is_dz = False
+        self.weapon = "(Kosong)"
+        self.armor = "(Kosong)"
+        self.inventory: list[str] = []
+        self.enemies = 0
+        self.monsters = 0
+        self.loot = 0
+
+        self.last_action = "-"
+        self.action_status = "-"
+        self.reason = "Standby"
+
+    def block(self) -> str:
+        dz_warn = "⚠️ BAHAYA!" if self.is_dz else "✅ Aman"
+        inv_text = ", ".join(self.inventory[:5]) if self.inventory else "(Tas Kosong)"
+        if len(self.inventory) > 5:
+            inv_text += f" (+{len(self.inventory) - 5} lagi)"
+        return (
+            f"  Room      : {self.game_id}\n"
+            f"  Kills     : 💀 {self.kills}    HP: {self.hp}    EP: {self.ep}\n"
+            f"  Posisi    : {self.region}   [{dz_warn}]\n"
+            f"  Equipment : Senjata={self.weapon} | Armor={self.armor}\n"
+            f"  Radar     : {self.enemies} Agent, {self.monsters} Monster, {self.loot} Loot\n"
+            f"  Tas       : {inv_text}\n"
+            f"  Aksi      : {self.last_action}  [{self.action_status}]\n"
+            f"  Alasan    : {self.reason}\n"
+        )
+
 
 class Dashboard:
     def __init__(self):
@@ -65,28 +145,16 @@ class Dashboard:
         self.acc_balance = "Loading..."
         self.acc_wallet = "Loading..."
 
-        # Game Info
-        self.game_id = "Menunggu Match..."
-        self.kills = 0
+        # Ekonomi
+        self.pack_pity = "N/A"
+        self.material_pity = "N/A"
+        self.last_shop_action = "-"
 
-        # Status
-        self.hp = "N/A"
-        self.ep = "N/A"
-        self.region = "N/A"
-        self.is_dz = False
-        self.weapon = "(Kosong)"
-        self.armor = "(Kosong)"
-
-        # Radar & Tas
-        self.inventory: list[str] = []
-        self.enemies = 0
-        self.monsters = 0
-        self.loot = 0
-
-        # Action Log
-        self.last_action = "-"
-        self.action_status = "-"
-        self.reason = "Standby"
+        # Slot game (free / paid, independen — lihat State Router)
+        self.slots: dict[str, SlotState] = {
+            "free": SlotState("FREE"),
+            "paid": SlotState("PAID"),
+        }
 
         # Throttle biar tidak flicker/boros CPU saat banyak free actions beruntun
         self._min_render_interval = 0.08
@@ -98,47 +166,25 @@ class Dashboard:
             return
         self._last_render_ts = now
 
-        # ANSI Escape Code: Clear screen (\033[2J) & Move cursor to top-left (\033[H)
-        dz_warn = "⚠️ (DEATH ZONE/BAHAYA!)" if self.is_dz else "✅ (Aman)"
-        inv_text = "\n  ".join(self.inventory) if self.inventory else "  (Tas Kosong)"
+        parts = ["\033[2J\033[H"]
+        parts.append("=========================================================\n")
+        parts.append(" 🤖 CLAW ROYALE BOT - DASHBOARD (MODE BARBAR)\n")
+        parts.append("=========================================================\n")
+        parts.append("[ 👤 AKUN ]\n")
+        parts.append(f"  Nama: {self.acc_name}   Balance: {self.acc_balance}   Wallet: {self.acc_wallet}\n\n")
+        parts.append("[ 💰 EKONOMI ]\n")
+        parts.append(f"  Pack Pity: {self.pack_pity}    Material Pity: {self.material_pity}\n")
+        parts.append(f"  Aksi Terakhir: {self.last_shop_action}\n\n")
 
-        ui = f"""\033[2J\033[H
-=========================================================
- 🤖 CLAW ROYALE BOT - DASHBOARD (MODE BARBAR)
-=========================================================
-[ 👤 AKUN ]
-  Nama      : {self.acc_name}
-  Balance   : {self.acc_balance}
-  Wallet    : {self.acc_wallet}
+        for slot in self.slots.values():
+            if not slot.enabled:
+                continue
+            parts.append(f"[ 🎮 SLOT {slot.label} ]\n")
+            parts.append(slot.block())
+            parts.append("\n")
 
-[ 🎮 GAME INFO ]
-  Room ID   : {self.game_id}
-  Kills     : 💀 {self.kills}
-
-[ ❤️ STATUS ]
-  HP        : {self.hp}
-  EP        : {self.ep}
-  Posisi    : {self.region}  {dz_warn}
-
-[ 🛡️ EQUIPMENT ]
-  Senjata   : {self.weapon}
-  Armor     : {self.armor}
-
-[ 🎒 INVENTORY (TAS) ]
-  {inv_text}
-
-[ 👁️ VISION (RADAR) ]
-  Musuh     : {self.enemies} Agent(s) Terlihat
-  Monster   : {self.monsters} Monster(s) Terlihat
-  Loot      : {self.loot} Item(s) di Tanah
-
-[ ⚡ LAST ACTION ]
-  Action    : {self.last_action}
-  Status    : {self.action_status}
-  Alasan    : {self.reason}
-=========================================================
-"""
-        sys.stdout.write(ui)
+        parts.append("=========================================================\n")
+        sys.stdout.write("".join(parts))
         sys.stdout.flush()
 
 
@@ -182,13 +228,20 @@ class RestClient:
             self.version = v
             return v
 
-    async def request(self, method: str, path: str, **kwargs) -> dict:
+    async def request(self, method: str, path: str, extra_headers: Optional[dict] = None, **kwargs) -> dict:
         assert self._session
         url = f"{REST_BASE}{path}"
+        headers = self._headers()
+        if extra_headers:
+            headers.update(extra_headers)
+
         for attempt in range(3):
-            async with self._session.request(method, url, headers=self._headers(), **kwargs) as resp:
+            async with self._session.request(method, url, headers=headers, **kwargs) as resp:
                 if resp.status == 426:
                     await self.fetch_version()
+                    headers = self._headers()
+                    if extra_headers:
+                        headers.update(extra_headers)
                     continue
                 text = await resp.text()
                 try:
@@ -201,20 +254,28 @@ class RestClient:
                 return data
         raise ApiError(426, "VERSION_MISMATCH", "failed after retry")
 
+    # -- account -----------------------------------------------------------
     async def get_me(self) -> dict:
         data = await self.request("GET", "/accounts/me")
         if "data" in data and isinstance(data.get("data"), dict) and "name" not in data:
             return data["data"]
         return data
 
+    async def get_balance(self) -> dict:
+        return await self.request("GET", "/accounts/me/balance")
+
+    # -- loadout -------------------------------------------------------------
     async def get_loadout(self) -> dict:
         return await self.request("GET", "/loadout")
 
-    async def get_inventory_relics(self) -> list:
-        return (await self.request("GET", "/inventory/relics")).get("data", [])
+    async def get_inventory_relics(self) -> dict:
+        return await self.request("GET", "/inventory/relics")
 
-    async def get_inventory_packs(self) -> list:
-        return (await self.request("GET", "/inventory/packs")).get("data", [])
+    async def get_inventory_packs(self) -> dict:
+        return await self.request("GET", "/inventory/packs")
+
+    async def get_inventory_items(self, category: str) -> dict:
+        return await self.request("GET", "/inventory/items", params={"category": category})
 
     async def set_active_pack(self, pack_instance_id: int) -> dict:
         return await self.request("PUT", "/loadout/pack", json={"packInstanceId": pack_instance_id})
@@ -225,8 +286,87 @@ class RestClient:
     async def equip_relic(self, type_index: int, relic_instance_id: int) -> dict:
         return await self.request("PUT", f"/loadout/slot/{type_index}", json={"relicInstanceId": relic_instance_id})
 
+    # -- shop (v1) -----------------------------------------------------------
+    async def get_shop_listings(self) -> dict:
+        return await self.request("GET", "/shop/listings")
+
+    async def shop_purchase(self, listing_id: int, quantity: int = 1, idempotency_key: Optional[str] = None) -> dict:
+        extra = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        return await self.request("POST", "/shop/purchase", extra_headers=extra,
+                                   json={"listingId": listing_id, "quantity": quantity})
+
+    async def get_shop_inventory_status(self) -> dict:
+        return await self.request("GET", "/shop/inventory-status")
+
+    # -- reforge ---------------------------------------------------------
+    async def reforge(self, relic_instance_id: int, item_key: str, idempotency_key: str) -> dict:
+        return await self.request("POST", "/reforge", json={
+            "relicInstanceId": relic_instance_id,
+            "itemKey": item_key,
+            "idempotencyKey": idempotency_key,
+        })
+
+    # -- marketplace (P2P) ------------------------------------------------
+    async def get_marketplace_listings(self, item_type: Optional[str] = None,
+                                        cursor: Optional[str] = None, limit: int = 20) -> dict:
+        params: dict[str, Any] = {"limit": limit}
+        if item_type:
+            params["itemType"] = item_type
+        if cursor:
+            params["cursor"] = cursor
+        return await self.request("GET", "/marketplace/listings", params=params)
+
+    async def marketplace_buy(self, listing_id: int, quantity: Optional[int] = None,
+                               idempotency_key: Optional[str] = None) -> dict:
+        extra = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        body: dict[str, Any] = {}
+        if quantity is not None:
+            body["quantity"] = quantity
+        return await self.request("POST", f"/marketplace/listings/{listing_id}/buy", extra_headers=extra, json=body)
+
+    async def marketplace_list(self, item_type: str, price: str, relic_instance_id: Optional[int] = None,
+                                pack_instance_id: Optional[int] = None, item_key: Optional[str] = None,
+                                quantity: Optional[int] = None, idempotency_key: Optional[str] = None) -> dict:
+        body: dict[str, Any] = {"itemType": item_type, "price": price}
+        if relic_instance_id is not None:
+            body["relicInstanceId"] = relic_instance_id
+        if pack_instance_id is not None:
+            body["packInstanceId"] = pack_instance_id
+        if item_key is not None:
+            body["itemKey"] = item_key
+        if quantity is not None:
+            body["quantity"] = quantity
+        extra = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        return await self.request("POST", "/marketplace/listings", extra_headers=extra, json=body)
+
+    async def marketplace_cancel(self, listing_id: int) -> dict:
+        return await self.request("DELETE", f"/marketplace/listings/{listing_id}")
+
+    # -- notifications ------------------------------------------------------
+    async def get_notifications(self, unread_only: bool = True, limit: int = 20) -> dict:
+        return await self.request("GET", "/notifications",
+                                   params={"unreadOnly": str(unread_only).lower(), "limit": limit})
+
+    async def mark_notification_read(self, notification_id: int) -> dict:
+        return await self.request("POST", f"/notifications/{notification_id}/read")
+
+    async def mark_all_notifications_read(self) -> dict:
+        return await self.request("POST", "/notifications/read-all")
+
+    # -- redeem ------------------------------------------------------------
+    async def redeem(self, code: str) -> dict:
+        return await self.request("POST", "/redeem", json={"code": code})
+
+    # -- dashboard (self-performance, read-only) -----------------------------
+    async def get_dashboard_overview(self) -> dict:
+        # Catatan: endpoint dashboard/* mengembalikan object view LANGSUNG,
+        # TANPA amplop {success, data} — beda dari kebanyakan endpoint lain.
+        return await self.request("GET", "/accounts/me/dashboard/overview")
+
 
 async def ensure_loadout(rest: RestClient) -> None:
+    """fullSet (Main pack + Sub pack + 3 relic) WAJIB supaya efek relic/pack
+    aktif sama sekali — partial set = base stats doang, nol efek."""
     try:
         loadout = (await rest.get_loadout()).get("data", {})
     except ApiError as e:
@@ -237,8 +377,8 @@ async def ensure_loadout(rest: RestClient) -> None:
         return
 
     try:
-        packs = await rest.get_inventory_packs()
-        relics = await rest.get_inventory_relics()
+        packs = (await rest.get_inventory_packs()).get("data", [])
+        relics = (await rest.get_inventory_relics()).get("data", [])
     except ApiError as e:
         log.warning("ensure_loadout: gagal ambil packs/relics: %s", e)
         return
@@ -251,6 +391,7 @@ async def ensure_loadout(rest: RestClient) -> None:
             await rest.set_active_pack(packs[0]["instanceId"])
         except ApiError as e:
             log.warning("set_active_pack gagal: %s", e)
+        # Sub pack TIDAK opsional — tanpa itu fullSet tidak akan pernah true.
         if len(packs) > 1:
             try:
                 await rest.set_sub_pack(packs[1]["instanceId"])
@@ -266,6 +407,207 @@ async def ensure_loadout(rest: RestClient) -> None:
                 await rest.equip_relic(type_index, candidate["instanceId"])
             except ApiError as e:
                 log.warning("equip_relic gagal: %s", e)
+
+
+# --------------------------------------------------------------------------
+# Economy manager — redeem, belanja shop, reforge, notifikasi, marketplace
+# --------------------------------------------------------------------------
+
+async def _run_redeem_welcome(rest: RestClient) -> None:
+    if not CLAW_AUTO_REDEEM_WELCOME:
+        return
+    try:
+        res = await rest.redeem("WELCOME")
+        data = res.get("data", res)
+        if data.get("replayed"):
+            dash.last_shop_action = "🎁 Kode WELCOME sudah pernah diklaim sebelumnya."
+        else:
+            n = len(data.get("items", []) or [])
+            dash.last_shop_action = f"🎁 Redeem WELCOME sukses ({n} item didapat)!"
+    except ApiError as e:
+        # Kalau memang tidak eligible/sudah pernah, biarkan lewat — bukan fatal.
+        log.warning("Redeem WELCOME gagal: %s", e)
+    dash.render(force=True)
+
+
+async def _update_economy_status(rest: RestClient) -> None:
+    try:
+        bal = (await rest.get_balance()).get("data", {})
+        if "balance" in bal:
+            dash.acc_balance = f"{bal['balance']} sMoltz"
+    except ApiError as e:
+        log.warning("Gagal ambil balance: %s", e)
+
+    try:
+        status = (await rest.get_shop_inventory_status())
+        data = status.get("data", status)
+        pack_pity = data.get("packPity", {}) or {}
+        mat_pity = data.get("materialPity", {}) or {}
+        dash.pack_pity = f"{pack_pity.get('counter', '?')}/{pack_pity.get('target', '?')}"
+        if pack_pity.get("guaranteed"):
+            dash.pack_pity += " (T1 GUARANTEED!)"
+        dash.material_pity = f"{mat_pity.get('counter', '?')}/{mat_pity.get('target', '?')}"
+    except ApiError as e:
+        log.warning("Gagal ambil shop inventory-status: %s", e)
+
+
+async def _check_notifications(rest: RestClient) -> None:
+    try:
+        notif = await rest.get_notifications(unread_only=True, limit=20)
+        items = notif.get("data", notif).get("items", [])
+    except ApiError as e:
+        log.warning("Gagal ambil notifications: %s", e)
+        return
+
+    for it in items:
+        if it.get("kind") == "marketplace_sale_completed":
+            payload = it.get("payload") or {}
+            dash.last_shop_action = f"💰 Listing terjual! +{payload.get('netAmount', '?')} sMoltz (setelah fee 7%)"
+            dash.render(force=True)
+        try:
+            await rest.mark_notification_read(it.get("id"))
+        except ApiError as e:
+            log.warning("Gagal tandai notifikasi terbaca: %s", e)
+
+
+async def _auto_shop(rest: RestClient) -> None:
+    if not CLAW_AUTO_SHOP:
+        return
+    try:
+        listings = (await rest.get_shop_listings()).get("data", {}).get("listings", [])
+    except ApiError as e:
+        log.warning("Gagal ambil shop listings: %s", e)
+        return
+    if not listings:
+        return
+
+    try:
+        balance = (await rest.get_balance()).get("data", {}).get("balance", 0)
+    except ApiError:
+        return
+
+    spend_cap = min(balance - CLAW_SHOP_MIN_RESERVE, CLAW_SHOP_MAX_SPEND_PER_CYCLE)
+    if spend_cap <= 0:
+        return
+
+    # Prioritas: material bundle (buat stok batu reforge) dulu, baru pack ticket.
+    materials = [l for l in listings if l.get("category") == "material"]
+    tickets = [l for l in listings if l.get("category") == "gacha_ticket"]
+
+    for listing in materials + tickets:
+        try:
+            price = float(listing.get("priceAmount", "0"))
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or price > spend_cap:
+            continue
+        try:
+            idem = str(uuid.uuid4())
+            await rest.shop_purchase(listing["id"], quantity=1, idempotency_key=idem)
+            dash.last_shop_action = f"🛒 Beli \"{listing.get('name')}\" seharga {price:.0f} sMoltz"
+            dash.render(force=True)
+            spend_cap -= price
+        except ApiError as e:
+            log.warning("Shop purchase gagal (%s): %s", listing.get("name"), e)
+        if spend_cap <= 0:
+            break
+
+
+async def _auto_reforge(rest: RestClient) -> None:
+    if not CLAW_AUTO_REFORGE:
+        return
+    try:
+        materials = (await rest.get_inventory_items("material")).get("data", [])
+    except ApiError as e:
+        log.warning("Gagal ambil material stone: %s", e)
+        return
+    stones = [m.get("itemKey") for m in materials if (m.get("quantity") or 0) > 0]
+    if not stones:
+        return
+
+    try:
+        relics = (await rest.get_inventory_relics()).get("data", [])
+    except ApiError as e:
+        log.warning("Gagal ambil relics: %s", e)
+        return
+
+    # Cuma relic yang TIDAK sedang dipasang di pack aktif & tidak sedang
+    # dilelang di marketplace yang boleh direforge (dilarang server kalau tidak).
+    candidates = [r for r in relics if not r.get("equippedPackInstanceId") and not r.get("isListed")]
+    if not candidates:
+        return
+
+    target = candidates[0]
+    stone_key = stones[0]
+    try:
+        idem = str(uuid.uuid4())
+        result = await rest.reforge(target["instanceId"], stone_key, idem)
+        outcome = result.get("data", {}).get("outcome", "?")
+        dash.last_shop_action = f"⚒️ Reforge {target.get('baseName', '?')} → {outcome}"
+        dash.render(force=True)
+    except ApiError as e:
+        log.warning("Reforge gagal: %s", e)
+
+
+async def _auto_marketplace(rest: RestClient) -> None:
+    """OPSIONAL (default OFF, aktifkan via CLAW_AUTO_MARKETPLACE=true). Beli
+    1 listing material termurah di bawah batas harga per siklus — supaya
+    tidak sembarangan menghabiskan saldo untuk barang orang lain."""
+    if not CLAW_AUTO_MARKETPLACE:
+        return
+    try:
+        listings = (await rest.get_marketplace_listings(item_type="material")).get("data", {}).get("items", [])
+    except ApiError as e:
+        log.warning("Gagal ambil marketplace listings: %s", e)
+        return
+
+    try:
+        balance = (await rest.get_balance()).get("data", {}).get("balance", 0)
+    except ApiError:
+        return
+
+    for listing in listings:
+        if listing.get("isMine") or listing.get("status") != "active":
+            continue
+        try:
+            price = float(listing.get("price", "0"))
+        except (TypeError, ValueError):
+            continue
+        if price <= 0 or price > CLAW_MARKET_MAX_MATERIAL_PRICE or price > (balance - CLAW_SHOP_MIN_RESERVE):
+            continue
+        try:
+            idem = str(uuid.uuid4())
+            await rest.marketplace_buy(listing["id"], quantity=1, idempotency_key=idem)
+            dash.last_shop_action = f"🤝 Beli material di marketplace seharga {price:.0f} sMoltz"
+            dash.render(force=True)
+        except ApiError as e:
+            log.warning("Marketplace buy gagal: %s", e)
+        break  # satu transaksi per siklus, biar tidak boros request/saldo
+
+
+async def economy_loop(rest: RestClient, stop: asyncio.Event) -> None:
+    """Loop terpisah dari gameplay: cek saldo/pity, redeem, belanja, reforge,
+    notifikasi, dan (opsional) marketplace, berjalan tiap CLAW_ECONOMY_INTERVAL
+    detik tanpa mengganggu loop permainan."""
+    await _run_redeem_welcome(rest)
+
+    while not stop.is_set():
+        try:
+            await _update_economy_status(rest)
+            await _check_notifications(rest)
+            dash.render(force=True)
+            await _auto_shop(rest)
+            await _auto_reforge(rest)
+            await _auto_marketplace(rest)
+        except ApiError as e:
+            log.warning("Economy cycle ApiError: %s", e)
+        except Exception:
+            log.exception("Economy cycle gagal")
+
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=CLAW_ECONOMY_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -291,7 +633,7 @@ def is_cooldown_action(kind: str) -> bool:
 
 def _get_weapon_range(w: dict) -> float:
     """Ambil jarak jangkau senjata, coba beberapa kemungkinan nama field
-    (beberapa API memakai nama field berbeda-beda), fallback ke 1 (Melee)."""
+    (API bisa saja memakai nama berbeda), fallback ke 1 (Melee)."""
     for key in ("range", "atkRange", "attackRange", "weaponRange", "reach", "distance"):
         val = w.get(key)
         if isinstance(val, (int, float)) and val > 0:
@@ -312,14 +654,15 @@ def _pick_engagement_target(view: dict, self_state: dict):
 
     hp = self_state.get("hp", 100)
     non_guardian = [a for a in visible_agents if not a.get("isGuardian")]
-    winnable = [a for a in non_guardian if a.get("hp", 999) <= hp * 1.5]
+    # Margin "menang" dipersempit (lihat catatan ranking di decide()) supaya
+    # weapon-switch juga konsisten dengan target yang benar-benar layak diserang.
+    winnable = [a for a in non_guardian if a.get("hp", 999) <= hp * 1.15]
     pool = winnable or non_guardian
 
     if pool:
         return min(pool, key=lambda a: a.get("hp", 999))
     if visible_monsters:
         return min(visible_monsters, key=lambda m: m.get("hp", 999))
-    # Tidak ada kandidat serang yang jelas -> pakai musuh terdekat sebagai acuan
     return min(all_enemies, key=lambda e: e.get("distance", 0))
 
 
@@ -331,7 +674,6 @@ def decide_free_actions(view: dict) -> list[Decision]:
     equipped_weapon = self_state.get("equippedWeapon")
     equipped_armor = self_state.get("equippedArmor")
 
-    # Deteksi target yang relevan (bukan cuma musuh terdekat) untuk Smart Weapon Switch
     engagement_target = _pick_engagement_target(view, self_state)
     target_distance = engagement_target.get("distance", 0) if engagement_target else 0
 
@@ -348,18 +690,14 @@ def decide_free_actions(view: dict) -> list[Decision]:
             w_range = _get_weapon_range(w)
 
             if target_distance > 1:
-                # Musuh Jauh -> Prioritaskan Senjata Ranged (Range > 1)
                 if w_range > 1:
                     return atk + 1000
                 return atk
             else:
-                # Musuh Dekat (atau tidak ada musuh terlihat) -> Prioritaskan Senjata Melee/ATK Terbesar
                 if w_range <= 1:
                     return atk + 1000
                 return atk
 
-        # Urutkan dulu berdasarkan id supaya tie-break stabil (hindari thrashing
-        # equip bolak-balik saat dua senjata skornya sama).
         best_weapon = max(sorted(all_weapons, key=lambda w: str(w.get("id", ""))), key=weapon_score)
 
         is_already_equipped = False
@@ -376,9 +714,6 @@ def decide_free_actions(view: dict) -> list[Decision]:
                 item_id=best_weapon.get("id"),
                 reason=f"Switch Senjata ({w_type}, jarak musuh~{target_distance}): {best_weapon.get('name')}"
             ))
-            # Sinkronkan state lokal supaya decide() di frame yang sama (yang
-            # dipanggil setelah free actions) sudah "tahu" senjata baru ini,
-            # bukan menunggu update dari server di frame berikutnya.
             self_state["equippedWeapon"] = best_weapon
 
     # ---------------------------------------------------------
@@ -458,21 +793,29 @@ def decide(view: dict, session: "GameSession") -> Decision:
     recovery_items = [i for i in inventory_items if i.get("category") in ["recovery", "consumable"]]
 
     # ---------------------------------------------------------
+    # 0. KELUAR DARI GUA — move DITOLAK TOTAL selagi inCave (server memvalidasi
+    #    ini SEBELUM cek adjacency, apapun kondisinya), jadi ini prioritas
+    #    paling atas: percuma coba kabur/heal-position kalau masih di gua.
+    # ---------------------------------------------------------
+    if in_cave:
+        facilities = view.get("visibleFacilities") or current_region.get("facilities") or current_region.get("interactables") or []
+        if facilities:
+            return Decision(kind="interact", interactable_id=facilities[0].get("id"), reason="🚪 Keluar dari Gua (Cave) dulu — move diblokir selagi di gua.")
+        return Decision(kind="interact", reason="🚪 Mencoba keluar dari Gua (Cave).")
+
+    # ---------------------------------------------------------
     # 1. SURVIVAL & RECOVERY
     # ---------------------------------------------------------
 
     # 1.1) FAST DEATH ZONE ESCAPE (Cari Jalur 100% Aman) — PRIORITAS TERTINGGI
     pending_here_ids = {dz.get("id") for dz in pending_deathzones}
     if is_death_zone or current_region.get("id") in pending_here_ids:
-        # Coret jalur yang mau meledak
         safe_targets = [c for c in connections if c not in pending_here_ids]
         if safe_targets:
-            # Utamakan jalur yang tidak ada history bahaya
             really_safe = [c for c in safe_targets if c not in session.dangerous_regions]
             chosen = random.choice(really_safe) if really_safe else random.choice(safe_targets)
             return Decision(kind="move", target_region_id=chosen, reason="🚨 KABUR CEPAT DARI DEATH ZONE!")
         elif connections:
-            # Darurat: Semua jalur mau meledak, pokoknya pindah dulu!
             return Decision(kind="move", target_region_id=random.choice(connections), reason="🚨 KABUR DARURAT! (Semua zona bahaya)")
 
     # 1.2) EARLY AUTO-HEAL (Naik ke 85%)
@@ -500,29 +843,28 @@ def decide(view: dict, session: "GameSession") -> Decision:
         return Decision(kind="move", target_region_id=random.choice(connections), reason="⚠️ Terlalu ramai (>12 agent), Reposisi!")
 
     # ---------------------------------------------------------
-    # 2. FIGHT (AGRESIF)
+    # 2. FIGHT — lebih hati-hati dari sebelumnya.
+    #    Ranking sekarang: alive > SURVIVAL TIME > kills > EP terpakai.
+    #    HP akhir TIDAK dihitung sama sekali. Artinya bertahan 1 turn lebih
+    #    lama > dapat 1 kill tambahan — jadi cuma ambil fight yang jelas
+    #    menguntungkan (margin HP musuh dipersempit) dan syarat HP diri
+    #    dinaikkan supaya tidak gambling nyawa demi kill.
     # ---------------------------------------------------------
     if visible_agents and ep > 0:
         non_guardian = [a for a in visible_agents if not a.get("isGuardian")]
-        winnable = [a for a in non_guardian if a.get("hp", 999) <= hp * 1.5]
+        winnable = [a for a in non_guardian if a.get("hp", 999) <= hp * 1.15]
         pool = winnable or non_guardian
-        if pool and hp_ratio >= 0.45:
+        if pool and hp_ratio >= 0.60:
             weakest = min(pool, key=lambda a: a.get("hp", 999))
-            return Decision(kind="attack", target_agent_id=weakest.get("id"), reason="⚔️ SERANG! Menghajar Agent terlemah.")
+            return Decision(kind="attack", target_agent_id=weakest.get("id"), reason="⚔️ SERANG! Menghajar Agent terlemah (fight yang jelas menguntungkan).")
 
-    if visible_monsters and ep > 0 and hp_ratio >= 0.35:
+    if visible_monsters and ep > 0 and hp_ratio >= 0.45:
         weakest_monster = min(visible_monsters, key=lambda m: m.get("hp", 999))
         return Decision(kind="attack", target_monster_id=weakest_monster.get("id"), reason="⚔️ SERANG! Menghabisi Monster untuk loot.")
 
     # ---------------------------------------------------------
     # 3. INTERAKSI & EKSPLORASI
     # ---------------------------------------------------------
-    if in_cave:
-        facilities = view.get("visibleFacilities") or current_region.get("facilities") or current_region.get("interactables") or []
-        if facilities:
-            return Decision(kind="interact", interactable_id=facilities[0].get("id"), reason="Keluar dari Gua (Cave).")
-        return Decision(kind="interact", reason="Mencoba keluar dari Gua (Cave).")
-
     alert_active = self_state.get("alertActive", False)
     alert_gauge = self_state.get("alertGauge", 0) or 0
     if visible_ruins and not alert_active and alert_gauge <= 6:
@@ -581,8 +923,6 @@ def build_action_payload(decision: Decision) -> dict:
 @dataclass
 class GameSession:
     entry_type: str
-    # Belum tahu status server, jadi jangan asumsikan bisa langsung beraksi
-    # sebelum ada konfirmasi via agent_view/can_act_changed.
     can_act: bool = False
     alive: bool = True
     game_id: Optional[str] = None
@@ -600,8 +940,6 @@ class GameSession:
     consecutive_failed_moves: int = 0
     last_explored_ruin_id: Optional[str] = None
     recently_attempted_free_actions: set = field(default_factory=set)
-    # Mencegah dua maybe_act() jalan bersamaan (mis. dipicu agent_view lalu
-    # can_act_changed hampir bersamaan) yang bisa mengirim aksi dobel.
     acting_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -630,62 +968,53 @@ def _is_in_danger(view: dict) -> bool:
     return bool(current_region.get("isDeathZone", False) or current_region.get("id") in pending_here_ids)
 
 
-async def update_dashboard_state(view: dict, session: GameSession):
-    """Memperbarui variabel dashboard agar sinkron dengan data server"""
+async def update_dashboard_state(view: dict, slot: SlotState) -> None:
+    """Memperbarui variabel dashboard (slot free/paid) agar sinkron dengan data server"""
     self_state = view.get("self", {}) or {}
 
-    dash.hp = f"{self_state.get('hp', 0)}/{self_state.get('maxHp', 0)}"
-    dash.ep = str(self_state.get("ep", 0))
-    dash.kills = self_state.get("kills", 0)
+    slot.hp = f"{self_state.get('hp', 0)}/{self_state.get('maxHp', 0)}"
+    slot.ep = str(self_state.get("ep", 0))
+    slot.kills = self_state.get("kills", 0)
 
     current_region = view.get("currentRegion", {}) or {}
-    dash.region = current_region.get("id", "N/A")
-    dash.is_dz = _is_in_danger(view)
+    slot.region = current_region.get("id", "N/A")
+    slot.is_dz = _is_in_danger(view)
 
-    dash.enemies = len(view.get("visibleAgents") or [])
-    dash.monsters = len(view.get("visibleMonsters") or [])
+    slot.enemies = len(view.get("visibleAgents") or [])
+    slot.monsters = len(view.get("visibleMonsters") or [])
 
     raw_items = (view.get("visibleItems") or []) + (current_region.get("items") or []) + (current_region.get("groundItems") or [])
-    dash.loot = len(raw_items)
+    slot.loot = len(raw_items)
 
     equipped_w = self_state.get("equippedWeapon")
-    dash.weapon = equipped_w.get("name") if isinstance(equipped_w, dict) else (str(equipped_w) if equipped_w else "(Kosong)")
+    slot.weapon = equipped_w.get("name") if isinstance(equipped_w, dict) else (str(equipped_w) if equipped_w else "(Kosong)")
 
     equipped_a = self_state.get("equippedArmor")
-    dash.armor = equipped_a.get("name") if isinstance(equipped_a, dict) else (str(equipped_a) if equipped_a else "(Kosong)")
+    slot.armor = equipped_a.get("name") if isinstance(equipped_a, dict) else (str(equipped_a) if equipped_a else "(Kosong)")
 
-    # Hitung Rekap Tas (Inventory)
     inventory_items = self_state.get("inventory") or []
     item_counts: dict[str, int] = {}
     for item in inventory_items:
         name = item.get("name", "Unknown Item")
         qty = item.get("quantity", 1)
         item_counts[name] = item_counts.get(name, 0) + qty
-    dash.inventory = [f"- {name} (x{qty})" for name, qty in item_counts.items()] if item_counts else []
+    slot.inventory = [f"{name} x{qty}" for name, qty in item_counts.items()] if item_counts else []
 
 
-async def maybe_act(ws, session: GameSession, view: dict) -> None:
+async def maybe_act(ws, session: GameSession, view: dict, slot: SlotState) -> None:
     if not view:
         return
 
     self_state = view.get("self", {}) or {}
-    if self_state.get("isAlive") is False:
+    if self_state.get("isAlive") is False or not session.alive:
         return
 
-    # Cegah re-entrancy: kalau maybe_act masih berjalan (menunggu I/O), panggilan
-    # kedua langsung dilewati alih-alih ikut antre dan mengirim aksi dobel.
     if session.acting_lock.locked():
         return
 
     async with session.acting_lock:
         in_danger = _is_in_danger(view)
 
-        # ----- PROSES FREE ACTIONS -----
-        # Kalau lagi dalam bahaya (Death Zone / region akan meledak), lewati
-        # looting & auto-equip dulu (armor) supaya perintah KABUR (move) bisa
-        # langsung dikirim tanpa delay antar-aksi. Weapon-equip tetap boleh
-        # kalau butuh switch cepat, tapi di sini kita prioritaskan kecepatan
-        # kabur di atas segalanya.
         if not in_danger:
             free_actions = decide_free_actions(view)
             for fd in free_actions:
@@ -695,17 +1024,16 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
                 session.recently_attempted_free_actions.add(dedup_key)
 
                 payload = build_action_payload(fd)
-                dash.last_action = fd.kind.upper()
-                dash.reason = fd.reason
-                dash.action_status = "Terkirim (No Cooldown)"
+                slot.last_action = fd.kind.upper()
+                slot.reason = fd.reason
+                slot.action_status = "Terkirim (No Cooldown)"
                 dash.render()
                 await ws.send(json.dumps(payload))
                 await asyncio.sleep(0.01)
         else:
-            dash.reason = "🚨 BAHAYA! Skip looting/equip, prioritas KABUR..."
+            slot.reason = "🚨 BAHAYA! Skip looting/equip, prioritas KABUR..."
             dash.render()
 
-        # ----- PROSES MAIN ACTION -----
         if not session.can_act:
             return
 
@@ -764,10 +1092,9 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
 
         payload = build_action_payload(decision)
 
-        # Update Dashboard
-        dash.last_action = decision.kind.upper()
-        dash.reason = decision.reason
-        dash.action_status = "Terkirim (Cooldown)"
+        slot.last_action = decision.kind.upper()
+        slot.reason = decision.reason
+        slot.action_status = "Terkirim (Cooldown)"
         dash.render()
 
         await ws.send(json.dumps(payload))
@@ -776,7 +1103,7 @@ async def maybe_act(ws, session: GameSession, view: dict) -> None:
             session.can_act = False
 
 
-async def play_session(ws, session: GameSession) -> str:
+async def play_session(ws, session: GameSession, slot: SlotState) -> str:
     async for raw in ws:
         try:
             frame = json.loads(raw)
@@ -792,10 +1119,12 @@ async def play_session(ws, session: GameSession) -> str:
 
         elif ftype == "assigned":
             session.game_id = frame.get("gameId")
-            dash.game_id = session.game_id
+            slot.game_id = session.game_id
             dash.render(force=True)
 
         elif ftype in ("agent_view", "turn_advanced", "handover_sync", "action_rejected"):
+            # action_rejected (baru di 1.15.0) punya bentuk frame IDENTIK dengan
+            # agent_view/turn_advanced, cuma reason-nya beda -> satu jalur saja.
             view = frame.get("view", {})
             if ftype != "action_rejected":
                 session.recently_attempted_free_actions.clear()
@@ -812,9 +1141,9 @@ async def play_session(ws, session: GameSession) -> str:
 
             session.last_view = view
             session.last_view_turn = frame.get("turn")
-            await update_dashboard_state(view, session)
+            await update_dashboard_state(view, slot)
             dash.render()
-            await maybe_act(ws, session, view)
+            await maybe_act(ws, session, view, slot)
 
         elif ftype == "action_result":
             success = frame.get("success", False)
@@ -824,47 +1153,58 @@ async def play_session(ws, session: GameSession) -> str:
 
             error = frame.get("error") or {}
             if not success:
-                if error.get("code") == "TARGET_DEAD" and session.last_action_target:
+                code = error.get("code", "Unknown Error")
+                if code == "TARGET_DEAD" and session.last_action_target:
+                    # Target sudah mati, BUKAN kita — turn tidak habis (canAct
+                    # sudah true), retry ke target lain di frame berikutnya.
                     session.confirmed_dead_targets.add(session.last_action_target)
+                elif code == "AGENT_DEAD":
+                    # Sinyal terminal punya sendiri — jangan kirim action lagi,
+                    # tunggu frame agent_died (meta.youDied) yang otoritatif.
+                    session.alive = False
                 if session.last_decision_kind == "move" and session.last_move_target_region is not None:
                     session.consecutive_failed_moves = 0
                     session.last_move_target_region = None
                     session.region_before_last_move = None
-                dash.action_status = f"GAGAL ({error.get('code', 'Unknown Error')})"
+                slot.action_status = f"GAGAL ({code})"
                 log.warning("Action gagal: %s", error)
             else:
-                dash.action_status = "SUKSES"
+                slot.action_status = "SUKSES"
             dash.render()
 
             inline_view = frame.get("view")
             if inline_view:
                 session.last_view = inline_view
                 session.last_view_turn = frame.get("turn", session.last_view_turn)
-                await update_dashboard_state(inline_view, session)
+                await update_dashboard_state(inline_view, slot)
                 dash.render()
 
         elif ftype == "can_act_changed":
             session.can_act = frame.get("canAct", True)
             if session.can_act and session.last_view:
-                await maybe_act(ws, session, session.last_view)
+                await maybe_act(ws, session, session.last_view, slot)
 
         elif ftype == "agent_died":
+            # SUMBER KEBENARAN "aku mati": meta.youDied dihitung per-viewer dan
+            # cuma ditempel ke salinan milik kita sendiri. JANGAN bandingkan
+            # agent_died.agentId dengan uuid asli — itu self-token per-game
+            # ("st_..."), tidak akan pernah cocok (Core Rule 18).
             meta = frame.get("meta", {}) or {}
             if meta.get("youDied"):
                 session.alive = False
-                dash.action_status = "MATI"
+                slot.action_status = "MATI"
                 dash.render(force=True)
                 return "died"
 
         elif ftype == "game_ended":
-            dash.action_status = "GAME SELESAI"
+            slot.action_status = "GAME SELESAI"
             dash.render(force=True)
             return "ended"
 
     return "closed"
 
 
-async def run_one_game(rest: RestClient, entry_type: str) -> str:
+async def run_one_game(rest: RestClient, entry_type: str, slot: SlotState) -> str:
     headers = {"X-API-Key": rest.api_key, "X-Version": rest.version}
     try:
         async with websockets.connect(WS_JOIN_URL, additional_headers=headers, ping_interval=20, ping_timeout=20) as ws:
@@ -872,46 +1212,92 @@ async def run_one_game(rest: RestClient, entry_type: str) -> str:
             if welcome.get("type") == "welcome" and welcome.get("decision") == "BLOCKED":
                 return "blocked"
 
+            # Selalu kirim hello walau decision == ALREADY_IN_GAME — kalau dua
+            # channel (free+paid) sekaligus live, server butuh tahu entryType
+            # mana yang mau di-resume, kalau tidak nanti 4003 HELLO_TIMEOUT.
             await send_hello(ws, entry_type)
             session = GameSession(entry_type=entry_type)
-            return await play_session(ws, session)
+            return await play_session(ws, session, slot)
     except ConnectionClosed as e:
         if e.code == 1013:
+            # RESUME_TARGET_DEAD: server TIDAK auto-fallback untuk paid (supaya
+            # tidak kena entry fee dobel). Re-dial SEKALI di iterasi berikutnya,
+            # jangan nunggu delay biasa.
             return "resume_dead"
         if e.code == 4032:
+            # Agent sudah mati di game itu — module menolak re-entry.
             return "died"
         log.warning("WebSocket ditutup (code=%s reason=%s)", e.code, e.reason)
         return "closed"
 
 
-async def choose_entry_type(rest: RestClient) -> Optional[str]:
-    me = await rest.get_me()
-    readiness = me.get("readiness", {}) or {}
-    current_games = me.get("currentGames", []) or []
+def _slot_is_live(me: dict, entry_type: str) -> bool:
+    games = me.get("currentGames") or []
+    return any(
+        g.get("entryType") == entry_type and g.get("isAlive") and g.get("gameStatus") != "finished"
+        for g in games
+    )
 
-    def live(entry: str) -> bool:
-        return any(g.get("entryType") == entry and g.get("isAlive") and g.get("gameStatus") != "finished" for g in current_games)
 
-    free_live = live("free")
-    paid_live = live("paid")
+def _slot_is_startable(me: dict, entry_type: str) -> bool:
+    if entry_type == "paid":
+        readiness = me.get("readiness", {}) or {}
+        return bool(readiness.get("paidReady"))
+    # Free readiness pretty much always passes barring SC-wallet-policy
+    # blockers — welcome frame's `decision` tetap jadi gerbang otoritatifnya.
+    return True
 
-    if ENTRY_TYPE_PREFERENCE == "paid":
-        return "paid" if paid_live or readiness.get("paidReady") else "free"
-    if ENTRY_TYPE_PREFERENCE == "free":
-        return "free"
 
-    if paid_live:
-        return "paid"
-    if free_live:
-        return "free"
-    if readiness.get("paidReady"):
-        return "paid"
-    return "free"
+async def game_slot_loop(rest: RestClient, entry_type: str, slot: SlotState, stop: asyncio.Event) -> None:
+    """Loop mandiri untuk SATU slot (free ATAU paid). Slot free & paid itu
+    independen (bisa hidup bersamaan) — lihat State Router di skill.md."""
+    reconnect_delay = RECONNECT_MIN_DELAY
+
+    while not stop.is_set():
+        try:
+            me = await rest.get_me()
+            live = _slot_is_live(me, entry_type)
+            startable = _slot_is_startable(me, entry_type)
+
+            if not live and not startable:
+                await asyncio.sleep(STATE_POLL_INTERVAL)
+                continue
+
+            if not live:
+                # Cuma perlu setup loadout sebelum game BARU, bukan saat resume.
+                await ensure_loadout(rest)
+
+            slot.game_id = "Resuming..." if live else "Mencari Matchmaking..."
+            dash.render(force=True)
+
+            outcome = await run_one_game(rest, entry_type, slot)
+
+            if outcome == "resume_dead":
+                # Bukan game sungguhan — cuma butuh satu ronde re-dial ekstra,
+                # jangan tunggu delay biasa (bukan retry-storm, cuma konvergen).
+                continue
+            elif outcome in ("died", "ended"):
+                reconnect_delay = RECONNECT_MIN_DELAY
+                await asyncio.sleep(INTER_GAME_DELAY)
+            elif outcome == "blocked":
+                await asyncio.sleep(STATE_POLL_INTERVAL)
+            else:
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
+
+        except Exception:
+            log.exception("Unhandled exception di game_slot_loop(%s)", entry_type)
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
 
 
 async def main_loop() -> None:
     if not API_KEY:
         print("CLAW_API_KEY is not set — see .env.example")
+        sys.exit(1)
+
+    if not RUN_FREE and not RUN_PAID:
+        print("CLAW_ENTRY_TYPE tidak mengaktifkan slot manapun. Set ke 'auto', 'free', atau 'paid'.")
         sys.exit(1)
 
     stop = asyncio.Event()
@@ -929,48 +1315,31 @@ async def main_loop() -> None:
     async with RestClient(API_KEY) as rest:
         await rest.fetch_version()
 
-        # Coba tarik data akun
         try:
             me = await rest.get_me()
             readiness = me.get("readiness", {}) or {}
-            # Set Info ke Dashboard
             dash.acc_name = me.get("name", "Unknown")
             dash.acc_balance = f"{me.get('balance', 0)} sMoltz"
             dash.acc_wallet = "Siap" if readiness.get("walletAddress") else "Belum Set"
-            dash.render(force=True)
         except ApiError as e:
             print(f"API Error saat mengambil info akun: {e}")
             sys.exit(1)
 
-        reconnect_delay = RECONNECT_MIN_DELAY
+        dash.slots["free"].enabled = RUN_FREE
+        dash.slots["paid"].enabled = RUN_PAID
+        dash.render(force=True)
 
-        while not stop.is_set():
-            try:
-                entry_type = await choose_entry_type(rest)
-                if entry_type is None:
-                    await asyncio.sleep(STATE_POLL_INTERVAL)
-                    continue
+        tasks = [asyncio.create_task(economy_loop(rest, stop))]
+        if RUN_FREE:
+            tasks.append(asyncio.create_task(game_slot_loop(rest, "free", dash.slots["free"], stop)))
+        if RUN_PAID:
+            tasks.append(asyncio.create_task(game_slot_loop(rest, "paid", dash.slots["paid"], stop)))
 
-                await ensure_loadout(rest)
+        await stop.wait()
 
-                dash.game_id = "Mencari Matchmaking..."
-                dash.render(force=True)
-
-                outcome = await run_one_game(rest, entry_type)
-
-                if outcome in ("died", "ended", "resume_dead"):
-                    reconnect_delay = RECONNECT_MIN_DELAY
-                    await asyncio.sleep(INTER_GAME_DELAY)
-                elif outcome == "blocked":
-                    await asyncio.sleep(STATE_POLL_INTERVAL)
-                else:
-                    await asyncio.sleep(reconnect_delay)
-                    reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
-
-            except Exception:
-                log.exception("Unhandled exception di main_loop")
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":
