@@ -668,6 +668,58 @@ def _pick_engagement_target(view: dict, self_state: dict):
     return min(all_enemies, key=lambda e: e.get("distance", 0))
 
 
+def _region_threat_score(view: dict, region_id: str, self_state: dict) -> float:
+    """Higher = worse to be in. Best-effort proxy: the API only tells us
+    about agents visible from HERE, not who's already standing in an
+    adjacent-but-unvisited region, so this scores based on where visible
+    agents report their own position, plus a small ambient penalty for
+    anyone close enough that they could plausibly be heading that way."""
+    hp = self_state.get("hp", 100)
+    score = 0.0
+    for a in (view.get("visibleAgents") or []):
+        if a.get("isGuardian"):
+            continue
+        a_region = a.get("regionId") or a.get("currentRegionId")
+        healthy = a.get("hp", 999) > hp * 0.5  # not an easy kill-steal target
+        if a_region == region_id:
+            score += 100 if healthy else 15
+        elif a.get("distance", 99) <= 1:
+            score += 5
+    return score
+
+
+def _pick_safest_route(view: dict, self_state: dict, connections: list[str],
+                        session: "GameSession", current_turn: Optional[int] = None) -> Optional[str]:
+    """Rank connections by (still 'hot' per dangerous_regions TTL, then live
+    threat score from what's currently visible) and return the best one.
+    Replaces random.choice for every flee/retreat/rat-mode path so 'run away'
+    actually means 'run toward the emptiest exit', not 'run somewhere random'."""
+    if not connections:
+        return None
+
+    def rank(c):
+        return (
+            1 if _is_region_hot(session, c, current_turn) else 0,
+            _region_threat_score(view, c, self_state),
+        )
+
+    return min(connections, key=rank)
+
+
+def _record_region_threats(view: dict, session: "GameSession", current_turn: Optional[int]) -> None:
+    """Beyond move-failure tracking: proactively mark any region we can
+    currently see as hosting a healthy (non-guardian) enemy, so escape/rat
+    logic avoids it before walking in blind, not just after a failed move."""
+    self_state = view.get("self", {}) or {}
+    hp = self_state.get("hp", 100)
+    for a in (view.get("visibleAgents") or []):
+        if a.get("isGuardian"):
+            continue
+        if a.get("hp", 999) > hp * 0.5:
+            a_region = a.get("regionId") or a.get("currentRegionId")
+            _mark_region_dangerous(session, a_region, current_turn)
+
+
 def decide_free_actions(view: dict) -> list[Decision]:
     """Free actions (0 cooldown): fast looting + smart equip (Jarak Musuh vs Weapon)."""
     free_decisions = []
@@ -819,38 +871,65 @@ def decide(view: dict, session: "GameSession") -> Decision:
     # 0. KELUAR DARI GUA — move DITOLAK TOTAL selagi inCave (server memvalidasi
     #    ini SEBELUM cek adjacency, apapun kondisinya), jadi ini prioritas
     #    paling atas: percuma coba kabur/heal-position kalau masih di gua.
+    #    Rotasi antar fasilitas + reset saat sudah keluar, supaya tidak stuck
+    #    menghajar ID fasilitas yang sama terus kalau ternyata itu bukan exit
+    #    (atau kalau interact-nya ditolak/diblokir guardian).
     # ---------------------------------------------------------
-    if in_cave:
+    if not in_cave:
+        session.tried_cave_facilities.clear()
+    else:
         facilities = view.get("visibleFacilities") or current_region.get("facilities") or current_region.get("interactables") or []
         if facilities:
-            return Decision(kind="interact", interactable_id=facilities[0].get("id"), reason="🚪 Keluar dari Gua (Cave) dulu — move diblokir selagi di gua.")
-        return Decision(kind="interact", reason="🚪 Mencoba keluar dari Gua.")
+            tried = session.tried_cave_facilities
+            untried = [f for f in facilities if f.get("id") not in tried]
+            target = (untried or facilities)[0]  # habis semua dicoba -> ulang dari awal
+            if target.get("id"):
+                tried.add(target.get("id"))
+            return Decision(kind="interact", interactable_id=target.get("id"),
+                             reason="🚪 Keluar dari Gua — coba fasilitas berikutnya." if untried
+                             else "🚪 Keluar dari Gua — semua fasilitas sudah dicoba, ulangi.")
+        return Decision(kind="interact", reason="🚪 Mencoba keluar dari Gua (tanpa fasilitas terdaftar).")
 
     # ---------------------------------------------------------
     # 1. SURVIVAL & RECOVERY
     # ---------------------------------------------------------
 
-    # 1.1) FAST DEATH ZONE ESCAPE (Cari Jalur 100% Aman) — PRIORITAS TERTINGGI
+    # 1.1) FAST DEATH ZONE ESCAPE (Cari Jalur PALING Aman, bukan sekadar
+    #      jalur non-DZ acak) — PRIORITAS TERTINGGI. Escape yang lolos DZ
+    #      tapi mendarat di tengah kerumunan sehat cuma menukar satu ancaman
+    #      dengan ancaman lain, jadi tetap dirangking pakai threat score.
     pending_here_ids = {dz.get("id") for dz in pending_deathzones}
     if is_death_zone or current_region.get("id") in pending_here_ids:
         safe_targets = [c for c in connections if c not in pending_here_ids]
-        if safe_targets:
-            really_safe = [c for c in safe_targets if c not in session.dangerous_regions]
-            chosen = random.choice(really_safe) if really_safe else random.choice(safe_targets)
-            return Decision(kind="move", target_region_id=chosen, reason="ZONA BERBAHAYA, KABUR!")
-        elif connections:
-            return Decision(kind="move", target_region_id=random.choice(connections), reason="KABUR DARURAT!")
+        pool = safe_targets or connections
+        if pool:
+            chosen = _pick_safest_route(view, self_state, pool, session, current_turn=view.get("turn"))
+            reason = "ZONA BERBAHAYA, KABUR ke rute paling aman!" if safe_targets else "KABUR DARURAT (semua jalur berisiko)!"
+            if chosen:
+                return Decision(kind="move", target_region_id=chosen, reason=reason)
 
-    # 1.2) EARLY AUTO-HEAL (Naik ke 85%)
-    if hp_ratio < 0.85 and recovery_items:
+    # 1.2) EARLY AUTO-HEAL — threshold adaptif: kalau tidak ada ancaman
+    #      sehat di sekitar, top-up murah sampai 85% selagi gratis untuk
+    #      dilakukan. Kalau ada ancaman, jangan boros item cuma buat naik
+    #      ke 85% — simpan buat momen kritis di tengah fight/kabur nanti.
+    nearby_threat = any(
+        not a.get("isGuardian") and a.get("hp", 999) > hp * 0.5
+        for a in visible_agents
+    )
+    heal_threshold = 0.60 if nearby_threat else 0.85
+    if hp_ratio < heal_threshold and recovery_items:
         best_hp_item = max(recovery_items, key=lambda i: i.get("hpRestore", 0))
         if best_hp_item.get("hpRestore", 0) > 0:
-            return Decision(kind="use_item", item_id=best_hp_item.get("id"), reason=f"Heal Pakai {best_hp_item.get('name')}")
+            return Decision(kind="use_item", item_id=best_hp_item.get("id"),
+                             reason=f"Heal Pakai {best_hp_item.get('name')} (threshold {heal_threshold:.0%}{', ada ancaman' if nearby_threat else ''})")
 
-    # 1.3) Critical HP + No Potions -> Hard Retreat
+    # 1.3) Critical HP + No Potions -> Hard Retreat (rute paling aman, bukan acak —
+    #      di HP kritis, mendarat di region yang salah bisa langsung fatal)
     if hp_ratio < 0.25:
         if connections:
-            return Decision(kind="move", target_region_id=random.choice(connections), reason=f"HP Sekarat ({hp_ratio:.0%}) & Habis Potion — Mundur!")
+            chosen = _pick_safest_route(view, self_state, connections, session, current_turn=view.get("turn"))
+            if chosen:
+                return Decision(kind="move", target_region_id=chosen, reason=f"HP Sekarat ({hp_ratio:.0%}) & Habis Potion — Mundur ke rute teraman!")
         return Decision(kind="wait", reason=f"HP Sekarat ({hp_ratio:.0%}) & Habis Potion, Tapi tidak ada jalan keluar.")
 
     # 1.4) Auto-Energy
@@ -863,25 +942,47 @@ def decide(view: dict, session: "GameSession") -> Decision:
 
     # 1.5) Hindari Kerumunan Massal (>12 orang)
     if len(visible_agents) > 12 and connections:
-        return Decision(kind="move", target_region_id=random.choice(connections), reason="Terlalu ramai, Reposisi!")
+        chosen = _pick_safest_route(view, self_state, connections, session, current_turn=view.get("turn"))
+        if chosen:
+            return Decision(kind="move", target_region_id=chosen, reason="Terlalu ramai, Reposisi ke rute paling sepi!")
 
     # ---------------------------------------------------------
     # 2. FIGHT — MODE RAT/SURVIVAL (Prioritas Bertahan Hidup)
     # ---------------------------------------------------------
     if visible_agents and ep > 0:
         non_guardian = [a for a in visible_agents if not a.get("isGuardian")]
-        
-        # PRIORITAS 1: NYAMPAH (Kill Steal). Cuma serang kalau HP musuh <= 20%
+
+        # PRIORITAS 1: NYAMPAH (Kill Steal) — HP musuh <= 20%, TAPI hanya
+        # diambil kalau balasan mereka (worst-case) dijamin tidak menjatuhkan
+        # kita di bawah safety floor. Ranking sekarang alive > survival time
+        # > kills, jadi 1 kill tambahan TIDAK layak ditukar dengan resiko
+        # mati — kalau target masih bisa membalas keras, lewati dan kabur.
         dying_enemies = [a for a in non_guardian if a.get("hp", 999) <= max_hp_guess * 0.20]
         if dying_enemies:
             weakest_dying = min(dying_enemies, key=lambda a: a.get("hp", 999))
-            return Decision(kind="attack", target_agent_id=weakest_dying.get("id"), reason="Nyampah agent sekarat!")
+            enemy_atk = weakest_dying.get("atk", weakest_dying.get("atkBonus", 0)) or 0
+            # Margin kasar 1.5x atk sebagai perkiraan worst-case burst damage
+            # dalam 1 turn balasan (tidak ada field "damage yang akan masuk"
+            # eksplisit di skill.md — kalau combat-items.md di skill kasih
+            # formula damage per-weapon yang lebih presisi, pakai itu di sini
+            # menggantikan angka 1.5 ini).
+            worst_case_incoming = enemy_atk * 1.5
+            safety_floor = max_hp_guess * 0.15
+            if hp - worst_case_incoming > safety_floor:
+                return Decision(kind="attack", target_agent_id=weakest_dying.get("id"),
+                                 reason="Nyampah agent sekarat — balasan mereka tidak akan mematikan kita.")
+            # else: target sekarat tapi masih bisa gigit balik cukup keras —
+            # jangan ambil resiko, lanjut ke logika kabur di bawah.
 
-        # PRIORITAS 2: KABUR! Kalau ada player sehat, jangan ladenin. Biarin mereka baku hantam.
+        # PRIORITAS 2: KABUR! Kalau ada player sehat (atau target sekarat
+        # tapi terlalu berbahaya untuk diserang), jangan ladenin — kabur ke
+        # rute dengan skor ancaman TERENDAH, bukan rute acak. Rute acak bisa
+        # saja lari LANGSUNG ke kerumunan sehat lain di region sebelah.
         if connections:
-            safe_routes = [c for c in connections if c not in session.dangerous_regions]
-            chosen_route = random.choice(safe_routes) if safe_routes else random.choice(connections)
-            return Decision(kind="move", target_region_id=chosen_route, reason="Ada player HP Jos, mending pindah aman!")
+            chosen_route = _pick_safest_route(view, self_state, connections, session, current_turn=view.get("turn"))
+            if chosen_route:
+                return Decision(kind="move", target_region_id=chosen_route,
+                                 reason="Ada player HP Jos / balasan terlalu beresiko, kabur ke rute paling aman!")
 
     # Cuma hunting monster kalau HP kita > 70% biar nggak gampang dibokong player lain.
     if visible_monsters and ep > 0 and hp_ratio >= 0.70:
@@ -900,10 +1001,13 @@ def decide(view: dict, session: "GameSession") -> Decision:
             return Decision(kind="explore", ruin_id=ruin.get("ruinId"), reason=f"Eksplorasi Ruin (Alert: {alert_gauge})")
 
     if connections:
-        safe_connections = [c for c in connections if c not in session.dangerous_regions]
-        if safe_connections:
-            return Decision(kind="move", target_region_id=random.choice(safe_connections), reason="Pindah ke zona aman.")
-        return Decision(kind="move", target_region_id=random.choice(connections), reason="Pindah Semua map berisiko.")
+        current_turn = view.get("turn")
+        safe_connections = [c for c in connections if not _is_region_hot(session, c, current_turn)]
+        pool = safe_connections or connections
+        chosen = _pick_safest_route(view, self_state, pool, session, current_turn=current_turn)
+        if chosen:
+            reason = "Pindah ke zona aman." if safe_connections else "Pindah — semua rute berisiko, ambil yang paling ringan."
+            return Decision(kind="move", target_region_id=chosen, reason=reason)
 
     return Decision(kind="wait", reason="Standby nunggu energi penuh.")
 
@@ -966,13 +1070,39 @@ class GameSession:
     confirmed_dead_targets: set = field(default_factory=set)
     last_seen_target_hp: dict = field(default_factory=dict)
     last_equipment_signature: Optional[str] = None
-    dangerous_regions: set = field(default_factory=set)
+    # region_id -> turn number saat terakhir kali region itu ditandai bahaya
+    # (baik karena move ke sana gagal, ATAUPUN karena kelihatan ada musuh
+    # sehat di sana). Dict + TTL (bukan set permanen) supaya sebuah region
+    # tidak di-blacklist selamanya hanya karena sekali kelihatan musuh lewat.
+    dangerous_regions: dict = field(default_factory=dict)
     region_before_last_move: Optional[str] = None
     last_move_target_region: Optional[str] = None
     consecutive_failed_moves: int = 0
     last_explored_ruin_id: Optional[str] = None
     recently_attempted_free_actions: set = field(default_factory=set)
+    tried_cave_facilities: set = field(default_factory=set)
     acting_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+# Berapa turn sebuah region tetap dianggap "panas" setelah terakhir kali
+# ditandai bahaya, sebelum dianggap aman lagi (decay, bukan blacklist permanen).
+DANGEROUS_REGION_TTL_TURNS = 3
+
+
+def _is_region_hot(session: "GameSession", region_id: Optional[str], current_turn: Optional[int]) -> bool:
+    if not region_id:
+        return False
+    seen_turn = session.dangerous_regions.get(region_id)
+    if seen_turn is None:
+        return False
+    if current_turn is None:
+        return True
+    return (current_turn - seen_turn) <= DANGEROUS_REGION_TTL_TURNS
+
+
+def _mark_region_dangerous(session: "GameSession", region_id: Optional[str], current_turn: Optional[int]) -> None:
+    if region_id:
+        session.dangerous_regions[region_id] = current_turn if current_turn is not None else 0
 
 
 def get_target_current_hp(view: dict, target_id: str) -> Optional[int]:
@@ -1165,17 +1295,23 @@ async def play_session(ws, session: GameSession, slot: SlotState) -> str:
             # ===================================
 
             current_region_id = (view.get("currentRegion") or {}).get("id")
+            frame_turn = frame.get("turn")
             if session.last_move_target_region is not None:
                 if current_region_id == session.region_before_last_move:
                     session.consecutive_failed_moves += 1
-                    session.dangerous_regions.add(session.last_move_target_region)
+                    _mark_region_dangerous(session, session.last_move_target_region, frame_turn)
                 else:
                     session.consecutive_failed_moves = 0
                 session.last_move_target_region = None
                 session.region_before_last_move = None
 
+            # Proaktif: tandai region yang KELIHATAN ada musuh sehat di sana
+            # sekarang, bukan cuma region yang gagal saat move ke sana dulu —
+            # supaya rat mode/escape logic menghindarinya SEBELUM jalan masuk.
+            _record_region_threats(view, session, frame_turn)
+
             session.last_view = view
-            session.last_view_turn = frame.get("turn")
+            session.last_view_turn = frame_turn
             await update_dashboard_state(view, slot)
             dash.render()
             await maybe_act(ws, session, view, slot)
