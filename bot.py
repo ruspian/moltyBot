@@ -105,8 +105,8 @@ class SlotState:
         self.enabled = True
 
         self.game_id = "Idle"
-        self.turn = 0             # <-- TAMBAHAN BARU
-        self.alive_players = "?"  # <-- TAMBAHAN BARU
+        self.turn = 0
+        self.alive_players = "?"
         self.kills = 0
         self.hp = "N/A"
         self.ep = "N/A"
@@ -1003,11 +1003,6 @@ def _is_in_danger(view: dict) -> bool:
 async def update_dashboard_state(view: dict, slot: SlotState) -> None:
     """Memperbarui variabel dashboard (slot free/paid) agar sinkron dengan data server"""
     self_state = view.get("self", {}) or {}
-    
-    # === Info Dashboard Baru ===
-    slot.turn = view.get("turn", slot.turn)
-    slot.alive_players = view.get("aliveAgents", "?") 
-    # ===========================
 
     slot.hp = f"{self_state.get('hp', 0)}/{self_state.get('maxHp', 0)}"
     slot.ep = str(self_state.get("ep", 0))
@@ -1160,11 +1155,14 @@ async def play_session(ws, session: GameSession, slot: SlotState) -> str:
             dash.render(force=True)
 
         elif ftype in ("agent_view", "turn_advanced", "handover_sync", "action_rejected"):
-            # action_rejected (baru di 1.15.0) punya bentuk frame IDENTIK dengan
-            # agent_view/turn_advanced, cuma reason-nya beda -> satu jalur saja.
             view = frame.get("view", {})
             if ftype != "action_rejected":
                 session.recently_attempted_free_actions.clear()
+
+            # === PERBAIKAN TURN & SISA AGENT ===
+            slot.turn = frame.get("turn", slot.turn)
+            slot.alive_players = frame.get("aliveAgents", slot.alive_players)
+            # ===================================
 
             current_region_id = (view.get("currentRegion") or {}).get("id")
             if session.last_move_target_region is not None:
@@ -1192,12 +1190,8 @@ async def play_session(ws, session: GameSession, slot: SlotState) -> str:
             if not success:
                 code = error.get("code", "Unknown Error")
                 if code == "TARGET_DEAD" and session.last_action_target:
-                    # Target sudah mati, BUKAN kita — turn tidak habis (canAct
-                    # sudah true), retry ke target lain di frame berikutnya.
                     session.confirmed_dead_targets.add(session.last_action_target)
                 elif code == "AGENT_DEAD":
-                    # Sinyal terminal punya sendiri — jangan kirim action lagi,
-                    # tunggu frame agent_died (meta.youDied) yang otoritatif.
                     session.alive = False
                 if session.last_decision_kind == "move" and session.last_move_target_region is not None:
                     session.consecutive_failed_moves = 0
@@ -1213,6 +1207,11 @@ async def play_session(ws, session: GameSession, slot: SlotState) -> str:
             if inline_view:
                 session.last_view = inline_view
                 session.last_view_turn = frame.get("turn", session.last_view_turn)
+                
+                # === UPDATE TURN JIKA ADA INLINE VIEW ===
+                slot.turn = session.last_view_turn
+                # ========================================
+                
                 await update_dashboard_state(inline_view, slot)
                 dash.render()
 
@@ -1222,10 +1221,6 @@ async def play_session(ws, session: GameSession, slot: SlotState) -> str:
                 await maybe_act(ws, session, session.last_view, slot)
 
         elif ftype == "agent_died":
-            # SUMBER KEBENARAN "aku mati": meta.youDied dihitung per-viewer dan
-            # cuma ditempel ke salinan milik kita sendiri. JANGAN bandingkan
-            # agent_died.agentId dengan uuid asli — itu self-token per-game
-            # ("st_..."), tidak akan pernah cocok (Core Rule 18).
             meta = frame.get("meta", {}) or {}
             if meta.get("youDied"):
                 session.alive = False
